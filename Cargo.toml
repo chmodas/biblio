@@ -1,0 +1,21 @@
+[package]
+name = "biblio"
+version = "0.0.0"
+edition = "2024"
+authors = ["Borislav Borisov <chmodas@astutebits.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/chmodas/biblio"
+homepage = "https://github.com/chmodas/biblio"
+readme = "README.md"
+description = "A unified bibliographic format converter."
+categories = ["parsing"]
+keywords = ["bibliography", "text-processing", "science"]
+rust-version = "1.85.0"
+
+exclude = [
+  ".gitignore",
+  ".github",
+  "README.md"
+]
+
+[dependencies]
