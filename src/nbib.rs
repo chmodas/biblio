@@ -5,7 +5,6 @@
 //! - [PubMed Help](https://pubmed.ncbi.nlm.nih.gov/help/)
 //! - [PubMed XML DTD (field definitions)](https://dtd.nlm.nih.gov/ncbi/pubmed/doc/out/250101/index.html)
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -13,6 +12,7 @@ use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
+use crate::parse_util::{append_to_last, append_to_opt, check_empty, normalize_line_endings};
 use crate::{Error, PublicationDate, Record};
 
 /// Parse NBIB-formatted text into zero or more [`Record`]s.
@@ -22,17 +22,8 @@ use crate::{Error, PublicationDate, Record};
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
 /// Returns [`Error::MissingRequiredField`] if a record lacks a `TI` (title) field.
 pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
-    if input.trim().is_empty() {
-        return Err(Error::EmptyInput);
-    }
-
-    // Normalise Windows line endings. Uses Cow to avoid allocation when the
-    // input already uses Unix endings (the common case).
-    let input: Cow<'_, str> = if input.contains('\r') {
-        Cow::Owned(input.replace("\r\n", "\n"))
-    } else {
-        Cow::Borrowed(input)
-    };
+    check_empty(input)?;
+    let input = normalize_line_endings(input);
 
     let mut records = Vec::new();
     let mut builder = RecordBuilder::default();
@@ -282,9 +273,9 @@ impl RecordBuilder {
             "TI" => append_to_opt(&mut self.title, text),
             "AB" => append_to_opt(&mut self.abstract_text, text),
             "JT" => append_to_opt(&mut self.journal, text),
-            "FAU" => append_to_last_vec(&mut self.fau_authors, text),
-            "AU" => append_to_last_vec(&mut self.au_authors, text),
-            "LID" | "AID" => append_to_last_vec(&mut self.doi_candidates, text),
+            "FAU" => append_to_last(&mut self.fau_authors, text),
+            "AU" => append_to_last(&mut self.au_authors, text),
+            "LID" | "AID" => append_to_last(&mut self.doi_candidates, text),
             _ => {}
         }
     }
@@ -316,19 +307,5 @@ impl RecordBuilder {
             isbn: self.isbn,
             extras: self.extras,
         })
-    }
-}
-
-fn append_to_opt(field: &mut Option<String>, text: &str) {
-    if let Some(existing) = field {
-        existing.push(' ');
-        existing.push_str(text);
-    }
-}
-
-fn append_to_last_vec(vec: &mut [String], text: &str) {
-    if let Some(last) = vec.last_mut() {
-        last.push(' ');
-        last.push_str(text);
     }
 }
