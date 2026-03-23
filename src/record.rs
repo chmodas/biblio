@@ -37,6 +37,8 @@ impl std::fmt::Display for PublicationDate {
     }
 }
 
+use std::collections::HashMap;
+
 /// A single bibliographic record in a unified, format-agnostic representation.
 ///
 /// # Construction
@@ -89,4 +91,8 @@ pub struct Record {
     /// ISBN (books) or ISSN (journals), depending on the publication type and what the source
     /// format provides.
     pub isbn: Option<String>,
+
+    /// Format-specific metadata not captured by the common fields above
+    /// (e.g. PMID, PMCID for NBIB; citation key for BibTeX).
+    pub extras: HashMap<String, String>,
 }
