@@ -1,8 +1,10 @@
+#![allow(dead_code)]
+
 use proptest::prelude::*;
 
 use biblio::PublicationDate;
 
-/// Printable ASCII without `\n` `\r` — safe for single-line bibliographic values.
+/// Printable ASCII without `\n` `\r` – safe for single-line bibliographic values.
 pub const VALUE_CHARS: &str = "[A-Za-z0-9 .,;:!?'\"()\\[\\]{}/<>@#$%^&*+=_~-]";
 
 pub fn arb_text(max_len: usize) -> impl Strategy<Value = String> {

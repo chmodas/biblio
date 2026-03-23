@@ -521,7 +521,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
         proptest::collection::vec(arb_author(), 0..5),
         proptest::option::of(arb_date()),
         proptest::option::of(arb_text(60)),
-        proptest::option::of("10\\.[0-9]{4}/[A-Za-z0-9().]{3,30}"), // no hyphens — would break page split
+        proptest::option::of("10\\.[0-9]{4}/[A-Za-z0-9().]{3,30}"), // no hyphens – would break page split
         proptest::option::of(arb_pages()),
         proptest::option::of(arb_volume()),
         proptest::option::of("[0-9]{1,4}"),

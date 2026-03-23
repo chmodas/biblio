@@ -54,7 +54,7 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
                         records.push(b.finish()?);
                     }
                 }
-                // Any other tag — dispatch to the current builder.
+                // Any other tag – dispatch to the current builder.
                 _ => {
                     if let Some(b) = builder.as_mut() {
                         b.dispatch(tag, value);
@@ -62,7 +62,7 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
                 }
             }
         } else if let Some(b) = builder.as_mut() {
-            // Continuation line — append to the previous field.
+            // Continuation line – append to the previous field.
             b.append_continuation(line.trim());
         }
     }
@@ -131,7 +131,7 @@ pub fn serialize(records: &[Record]) -> String {
             write_tag(&mut buf, "SN", isbn);
         }
 
-        // Extras — sort keys for deterministic output.
+        // Extras – sort keys for deterministic output.
         let mut extras_sorted: Vec<_> = record.extras.iter().collect();
         extras_sorted.sort_by_key(|(k, _)| k.as_str());
         for (key, value) in extras_sorted {
