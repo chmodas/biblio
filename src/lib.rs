@@ -3,6 +3,7 @@
 //! `biblio` provides a unified [`Record`] type that captures the metadata common to
 //! `RIS`, `NBIB`, `EndNote XML`, `BibTeX`, and `BibLaTeX` files.
 mod error;
+pub mod nbib;
 mod record;
 
 pub use error::Error;
