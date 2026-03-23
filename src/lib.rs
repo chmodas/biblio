@@ -4,7 +4,9 @@
 //! `RIS`, `NBIB`, `EndNote XML`, `BibTeX`, and `BibLaTeX` files.
 mod error;
 pub mod nbib;
+mod parse_util;
 mod record;
+pub mod ris;
 
 pub use error::Error;
 pub use record::{PublicationDate, Record};
