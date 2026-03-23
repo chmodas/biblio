@@ -2,6 +2,7 @@
 //!
 //! `biblio` provides a unified [`Record`] type that captures the metadata common to
 //! `RIS`, `NBIB`, `EndNote XML`, `BibTeX`, and `BibLaTeX` files.
+pub mod bibtex;
 pub mod endnote_xml;
 mod error;
 pub mod nbib;
