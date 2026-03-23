@@ -1,8 +1,12 @@
+mod common;
+
 use proptest::prelude::*;
 use std::collections::HashMap;
 
 use biblio::nbib::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
+
+use common::{arb_author, arb_date, arb_pages, arb_text, arb_volume};
 
 // -- Core parsing --
 
@@ -389,11 +393,9 @@ fn serialize_skips_none_fields() {
     assert!(!output.contains("JT"));
 }
 
-// -- Proptest helpers and strategies --
+// -- NBIB-specific proptest helpers --
 
-const NBIB_VALUE_CHARS: &str = "[A-Za-z0-9 .,;:!?'\"()\\[\\]{}/<>@#$%^&*+=_~-]";
-
-fn format_date_for_test(date: PublicationDate) -> String {
+fn format_nbib_date(date: PublicationDate) -> String {
     let months = [
         "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -404,56 +406,21 @@ fn format_date_for_test(date: PublicationDate) -> String {
     }
 }
 
-fn arb_nbib_text(max_len: usize) -> impl Strategy<Value = String> {
-    proptest::string::string_regex(&format!("{NBIB_VALUE_CHARS}{{1,{max_len}}}"))
-        .unwrap()
-        .prop_map(|s| s.trim_end().to_owned())
-        .prop_filter("must not be empty after trim", |s| !s.is_empty())
-}
-
-fn arb_author() -> impl Strategy<Value = String> {
+fn arb_nbib_record() -> impl Strategy<Value = Record> {
     (
-        "[A-Z][a-z'-]{1,15}( [A-Z][a-z'-]{1,10}){0,2}",
-        "[A-Z][a-z'-]{1,15}( [A-Z]\\.?){0,2}",
-    )
-        .prop_map(|(last, first)| format!("{last}, {first}"))
-}
-
-fn arb_record() -> impl Strategy<Value = Record> {
-    (
-        arb_nbib_text(80),                             // title
-        proptest::collection::vec(arb_author(), 0..5), // authors
-        proptest::option::of((
-            // date
-            1900_i32..2100,
-            proptest::option::of(1_u8..=12),
-            proptest::option::of(1_u8..=28),
-        )),
-        proptest::option::of(arb_nbib_text(60)), // journal
-        proptest::option::of(
-            // doi
-            "10\\.[0-9]{4}/[A-Za-z0-9().\\-]{3,30}",
-        ),
-        proptest::option::of(prop_oneof![
-            // pages
-            "[0-9]{1,4}-[0-9]{1,4}",   // range
-            "e[0-9]{3,6}",             // e-article
-            "S[0-9]{1,3}-S[0-9]{1,3}", // supplement
-            "[0-9]{1,4}",              // single page
-        ]),
-        proptest::option::of(prop_oneof![
-            // volume
-            "[0-9]{1,3}",
-            "[0-9]{1,3}[A-Z]", // e.g. "12A"
-            "S[0-9]{1,2}",     // supplement
-            "Suppl [0-9]",
-        ]),
-        proptest::option::of("[0-9]{1,4}"),       // number
-        proptest::option::of(arb_nbib_text(300)), // abstract
+        arb_text(80),
+        proptest::collection::vec(arb_author(), 0..5),
+        proptest::option::of(arb_date()),
+        proptest::option::of(arb_text(60)),
+        proptest::option::of("10\\.[0-9]{4}/[A-Za-z0-9().\\-]{3,30}"),
+        proptest::option::of(arb_pages()),
+        proptest::option::of(arb_volume()),
+        proptest::option::of("[0-9]{1,4}"),
+        proptest::option::of(arb_text(300)),
         (
-            proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"), // ISSN
-            proptest::option::of("[0-9]{5,8}"),              // PMID
-            proptest::option::of("PMC[0-9]{5,8}"),           // PMC
+            proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
+            proptest::option::of("[0-9]{5,8}"),
+            proptest::option::of("PMC[0-9]{5,8}"),
         ),
     )
         .prop_map(
@@ -469,10 +436,6 @@ fn arb_record() -> impl Strategy<Value = Record> {
                 abstract_text,
                 (isbn, pmid, pmc),
             )| {
-                let date = date.map(|(year, month, day)| {
-                    let day = if month.is_some() { day } else { None };
-                    PublicationDate { year, month, day }
-                });
                 let mut extras = HashMap::new();
                 if let Some(pmid) = pmid {
                     extras.insert("PMID".into(), pmid);
@@ -506,14 +469,8 @@ proptest! {
     }
 
     #[test]
-    fn date_round_trip(
-        year in 1900_i32..2100,
-        month in proptest::option::of(1_u8..=12),
-        day in proptest::option::of(1_u8..=28),
-    ) {
-        let day = if month.is_some() { day } else { None };
-        let date = PublicationDate { year, month, day };
-        let formatted = format_date_for_test(date);
+    fn date_round_trip(date in arb_date()) {
+        let formatted = format_nbib_date(date);
         let reparsed = parse(&format!("TI  - t\nDP  - {formatted}\n"))
             .unwrap()[0]
             .date
@@ -522,7 +479,7 @@ proptest! {
     }
 
     #[test]
-    fn serialize_round_trip(record in arb_record()) {
+    fn serialize_round_trip(record in arb_nbib_record()) {
         let serialized = serialize(std::slice::from_ref(&record));
         let reparsed = parse(&serialized).unwrap();
         prop_assert_eq!(vec![record], reparsed);
