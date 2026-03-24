@@ -15,9 +15,8 @@ use crate::{Error, PublicationDate, Record};
 
 /// Parse `EndNote XML` text into zero or more [`Record`]s.
 ///
-/// Handles both `<xml><records>...</records></xml>` and bare
-/// `<records>...</records>` roots. Strips presentational `<style>` tags
-/// before parsing.
+/// Handles both `<xml><records>...</records></xml>` and bare `<records>...</records>` roots. Strips
+/// presentational `<style>` tags before parsing.
 ///
 /// # Errors
 ///
@@ -100,6 +99,9 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
 }
 
 /// Serialize [`Record`]s to `EndNote XML` format.
+///
+/// Produces a well-formed XML document with `<xml><records>...</records></xml>` structure. Text
+/// values are CDATA-escaped.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -204,7 +206,11 @@ fn write_simple_element(writer: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
 
 // -- Style tag stripping --
 
-/// Strip `<style ...>` opening tags and `</style>` closing tags from the XML.
+/// Strip `<style ...>` and `</style>` tags from the XML.
+///
+/// `EndNote` wraps text content in presentational `<style face="bold" ...>` tags that carry no
+/// bibliographic meaning. Removing them before parsing keeps the XML walker simple and the
+/// extracted text clean.
 fn strip_style_tags(xml: &str) -> String {
     let mut result = String::with_capacity(xml.len());
     let mut remaining = xml;
@@ -256,7 +262,7 @@ impl RecordBuilder {
     /// Map the current element path plus text content to the appropriate field.
     ///
     /// Paths are relative to the `<record>` element. For example, the title arrives as a path
-    /// `["record", "titles", "title"]` with the title text.
+    /// `["record", "titles", "title"]` with the title text as content.
     fn set_field(&mut self, path: &[String], text: &str) {
         if text.is_empty() {
             return;

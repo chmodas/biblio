@@ -1,4 +1,4 @@
-//! Parser and serializer for the NBIB (PubMed/MEDLINE) bibliographic format.
+//! Parser and serializer for the `NBIB` (PubMed/MEDLINE) bibliographic format.
 //!
 //! # References
 //!
@@ -15,7 +15,7 @@ use winnow::token::{rest, take_while};
 use crate::parse_util::{append_to_last, append_to_opt, check_empty, normalize_line_endings};
 use crate::{Error, PublicationDate, Record};
 
-/// Parse NBIB-formatted text into zero or more [`Record`]s.
+/// Parse `NBIB`-formatted text into zero or more [`Record`]s.
 ///
 /// # Errors
 ///
@@ -70,7 +70,10 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
     Ok(records)
 }
 
-/// Serialize [`Record`]s to NBIB format.
+/// Serialize [`Record`]s to `NBIB` format.
+///
+/// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
+/// suffix. Records are separated by blank lines.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -196,10 +199,10 @@ fn extract_doi(candidates: &[String]) -> Option<String> {
         .map(|c| c[..c.len() - 6].to_owned())
 }
 
-/// Parse a single NBIB tag line into its (tag, value) pair.
+/// Parse a single `NBIB` tag line into its (tag, value) pair.
 ///
-/// The NBIB line format is: a 2-4 character uppercase tag, left-justified in a
-/// 4-character field, followed by `"- "` and the value. For example:
+/// The `NBIB` line format is: a 2-4 character uppercase tag, left-justified in a 4-character field,
+/// followed by `"- "` and the value. For example:
 ///
 /// ```text
 /// TI  - Article title here
