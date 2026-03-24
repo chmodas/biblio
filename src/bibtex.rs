@@ -1,7 +1,7 @@
 //! Parser and serializer for the `BibTeX`/`BibLaTeX` bibliographic format.
 //!
-//! Delegates parsing to the [`biblatex`](https://docs.rs/biblatex) crate and maps
-//! entries to the unified [`Record`] type.
+//! Delegates parsing to the [`biblatex`](https://docs.rs/biblatex) crate and maps entries to the
+//! unified [`Record`] type.
 //!
 //! # References
 //!
@@ -35,6 +35,9 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
 }
 
 /// Serialize [`Record`]s to `BibTeX` format.
+///
+/// Each record is emitted as an `@article` entry. The citation key is taken from `extras["key"]`,
+/// falling back to `"unknown"`.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut out = String::new();
@@ -175,7 +178,7 @@ fn record_from_entry(entry: &biblatex::Entry) -> Result<Record, Error> {
     })
 }
 
-/// Format a `Person` as "Last, First" (the convention used by `Record.authors`).
+/// Format a [`Person`] as `"Last, First"` (the convention used by [`Record::authors`]).
 fn format_person(person: &Person) -> String {
     let mut parts = String::new();
     if !person.prefix.is_empty() {
@@ -194,6 +197,11 @@ fn format_person(person: &Person) -> String {
     parts
 }
 
+/// Extract a [`PublicationDate`] from a biblatex entry.
+///
+/// Tries the `date` field first (ISO 8601 or free-text). Falls back to the `year` field. The
+/// biblatex crate uses 0-indexed month and day internally, so both are incremented by 1 before
+/// storing.
 fn parse_date(entry: &biblatex::Entry) -> Option<PublicationDate> {
     if let Ok(date) = entry.get_as::<PermissiveType<Date>>("date") {
         return match date {

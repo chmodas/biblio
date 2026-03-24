@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Errors produced when parsing or serialising bibliographic data.
+/// Errors produced when parsing or serializing bibliographic data.
 ///
 /// # Matching
 ///
@@ -17,19 +17,17 @@ pub enum Error {
 
     /// A record was found but lacked a mandatory field.
     ///
-    /// `tag` names the missing field in the source format's own vocabulary
-    /// (e.g. `"TY"` for RIS, `"title"` for BibTeX). `line` is the
-    /// one-indexed line number where the record started.
+    /// `tag` names the missing field in the source format's own vocabulary (e.g. `"TY"` for `RIS`,
+    /// `"title"` for `BibTeX`). `line` is the one-indexed line number where the record started.
     MissingRequiredField { tag: &'static str, line: usize },
 
-    /// The format was recognised, but the data is syntactically broken.
+    /// The format was recognized, but the data is syntactically broken.
     ///
-    /// `line` points to the offending line (one-indexed) and `message`
-    /// describes what was expected versus what was found.
+    /// `line` points to the offending line (one-indexed) and `message` describes what was expected
+    /// versus what was found.
     MalformedSyntax { line: usize, message: String },
 
-    /// An underlying system or third-party error that does not map to a
-    /// more specific variant.
+    /// An underlying system or third-party error that does not map to a more specific variant.
     Internal(String),
 }
 

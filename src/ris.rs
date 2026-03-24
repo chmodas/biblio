@@ -1,4 +1,4 @@
-//! Parser and serializer for the RIS bibliographic format.
+//! Parser and serializer for the `RIS` bibliographic format.
 //!
 //! # References
 //!
@@ -14,7 +14,7 @@ use winnow::token::{rest, take_while};
 use crate::parse_util::{append_to_last, append_to_opt, check_empty, normalize_line_endings};
 use crate::{Error, PublicationDate, Record};
 
-/// Parse RIS-formatted text into zero or more [`Record`]s.
+/// Parse `RIS`-formatted text into zero or more [`Record`]s.
 ///
 /// # Errors
 ///
@@ -29,7 +29,7 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
 
     // Each RIS line is one of three kinds:
     //   1. Tag line:  "XX  - value"  (exactly 2 uppercase chars, two spaces, dash, space)
-    //   2. End tag:   "ER  -"        (finalises the current record)
+    //   2. End tag:   "ER  -"        (finalizes the current record)
     //   3. Start tag: "TY  - TYPE"   (begins a new record)
     // Lines that don't match a tag pattern while inside a record are continuation lines.
     for (line_idx, line) in input.lines().enumerate() {
@@ -48,7 +48,7 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
                         ..RecordBuilder::default()
                     });
                 }
-                // ER finalises the current record.
+                // ER finalizes the current record.
                 "ER" => {
                     if let Some(b) = builder.take() {
                         records.push(b.finish()?);
@@ -75,7 +75,11 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
     Ok(records)
 }
 
-/// Serialize [`Record`]s to RIS format.
+/// Serialize [`Record`]s to `RIS` format.
+///
+/// Each record is emitted as type `JOUR` (journal article). Pages are split into `SP`/`EP` tags on
+/// hyphens or en-dashes. Entries in `extras` are written as additional tags with their key as the
+/// tag name.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -172,10 +176,10 @@ fn parse_date(value: &str) -> Option<PublicationDate> {
     Some(PublicationDate { year, month, day })
 }
 
-/// Parse a single RIS tag line into its (tag, value) pair.
+/// Parse a single `RIS` tag line into its (tag, value) pair.
 ///
-/// The RIS line format is exactly: 2 uppercase characters, two spaces, a dash,
-/// a space, then the value. For example:
+/// The `RIS` line format is exactly: 2 uppercase characters, two spaces, a dash, a space, then the
+/// value. For example:
 ///
 /// ```text
 /// TI  - Article title here
@@ -183,9 +187,9 @@ fn parse_date(value: &str) -> Option<PublicationDate> {
 /// ER  -
 /// ```
 ///
-/// The `winnow` parser consumes `input` left to right through a chain of
-/// `parse_next` calls. Each call advances the input past what it matched or
-/// returns `Err` to signal the line isn't a valid tag line.
+/// The `winnow` parser consumes `input` left to right through a chain of `parse_next` calls. Each
+/// call advances the input past what it matched or returns `Err` to signal the line isn't a valid
+/// tag line.
 fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> {
     // Consume exactly 2 uppercase ASCII characters for the tag (e.g. "TI", "AU", "ER").
     let tag = take_while(2..=2, |c: char| {

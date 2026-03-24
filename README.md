@@ -1,6 +1,6 @@
 # biblio
 
-biblio parses and serialises **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, and **BibLaTeX** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
+biblio parses and serializes **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, and **BibLaTeX** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
 
 > **Work in progress.** The current `Record` carries the minimum useful set of fields (title, authors, date, journal, DOI, pages, volume, number, abstract, ISBN/ISSN). Additional fields – keywords, URLs, publication type, language, funding, affiliations, and more – will be added in upcoming releases.
 
@@ -60,6 +60,6 @@ Fields that don't map neatly to the common schema (PMID, PMCID, citation key, et
 
 All parsers return `Result<Vec<Record>, biblio::Error>`. The error type distinguishes empty input, missing required fields (with the offending tag name and line number), malformed syntax, and internal errors.
 
-## Licence
+## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

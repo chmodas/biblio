@@ -1,8 +1,8 @@
 /// The publication date of a bibliographic record.
 ///
-/// Only the `year` is guaranteed to be present. Month and day are available when the source
-/// format provides them (e.g. NBIB's `DP` field often includes all three, while BibTeX
-/// entries may only carry a year).
+/// Only the `year` is guaranteed to be present. Month and day are available when the source format
+/// provides them (e.g. `NBIB`'s `DP` field often includes all three, while `BibTeX` entries may
+/// only carry a year).
 ///
 /// # Examples
 ///
@@ -10,11 +10,19 @@
 /// use biblio::PublicationDate;
 ///
 /// // Year only (most common)
-/// let date = PublicationDate { year: 2024, month: None, day: None };
+/// let date = PublicationDate {
+///     year: 2024,
+///     month: None,
+///     day: None,
+/// };
 /// assert_eq!(date.to_string(), "2024");
 ///
 /// // Full date
-/// let date = PublicationDate { year: 2024, month: Some(9), day: Some(1) };
+/// let date = PublicationDate {
+///     year: 2024,
+///     month: Some(9),
+///     day: Some(1),
+/// };
 /// assert_eq!(date.to_string(), "2024-09-01");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,16 +51,20 @@ use std::collections::HashMap;
 ///
 /// # Construction
 ///
-/// The struct derives [`Default`], so the idiomatic way to build one
-/// is to start from the default and set only the fields you have:
+/// The struct derives [`Default`], so the idiomatic way to build one is to start from the default
+/// and set only the fields you have:
 ///
 /// ```
-/// use biblio::{Record, PublicationDate};
+/// use biblio::{PublicationDate, Record};
 ///
 /// let rec = Record {
 ///     title: "My paper".into(),
 ///     authors: vec!["Doe, Jane".into()],
-///     date: Some(PublicationDate { year: 2024, month: None, day: None }),
+///     date: Some(PublicationDate {
+///         year: 2024,
+///         month: None,
+///         day: None,
+///     }),
 ///     ..Default::default()
 /// };
 /// ```
@@ -63,8 +75,8 @@ pub struct Record {
 
     /// Authors of the publication as display-ready strings (e.g. `"Doe, Jane"`, `"Bloggs, Joe"`).
     ///
-    /// The order matches the order in the source. An empty Vec means no authors were found,
-    /// which is unusual but possible (e.g. institutional reports).
+    /// The order matches the order in the source. An empty Vec means no authors were found, which
+    /// is unusual but possible (e.g. institutional reports).
     pub authors: Vec<String>,
 
     /// Publication date.
@@ -92,7 +104,7 @@ pub struct Record {
     /// format provides.
     pub isbn: Option<String>,
 
-    /// Format-specific metadata not captured by the common fields above
-    /// (e.g. PMID, PMCID for NBIB; citation key for BibTeX).
+    /// Format-specific metadata not captured by the common fields above (e.g. PMID, PMCID for
+    /// `NBIB`; citation key for `BibTeX`).
     pub extras: HashMap<String, String>,
 }
