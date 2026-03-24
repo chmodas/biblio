@@ -1,5 +1,8 @@
 # biblio
 
+[![CI](https://github.com/chmodas/biblio/actions/workflows/ci.yml/badge.svg)](https://github.com/chmodas/biblio/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/chmodas/biblio/graph/badge.svg?token=5KAFOZEH6G)](https://codecov.io/gh/chmodas/biblio)
+
 biblio parses and serializes **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, and **BibLaTeX** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
 
 > **Work in progress.** The current `Record` carries the minimum useful set of fields (title, authors, date, journal, DOI, pages, volume, number, abstract, ISBN/ISSN). Additional fields – keywords, URLs, publication type, language, funding, affiliations, and more – will be added in upcoming releases.
