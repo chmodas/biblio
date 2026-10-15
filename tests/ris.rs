@@ -1,7 +1,11 @@
 mod common;
 
+use proptest::collection::vec;
 use proptest::prelude::*;
+use proptest::sample::{select, subsequence};
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use test_strategy::{Arbitrary, proptest};
 
 use biblio::ris::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
@@ -351,6 +355,135 @@ ER  -
     assert_eq!(records[0].journal.as_deref(), Some("Science"));
 }
 
+// -- Journal --
+
+/// The tags that carry a journal name, in order of preference. This is a copy of the parser's
+/// list, so that the tests pin the order independently of the implementation.
+const JOURNAL_TAGS: [&str; 6] = ["JF", "T2", "JO", "JA", "J2", "J1"];
+
+/// Parse a single record whose body, after the type and title, is `tag_lines`, and return its
+/// journal.
+fn journal_of(tag_lines: &str) -> Option<String> {
+    let input = format!("TY  - JOUR\nTI  - A test title\n{tag_lines}ER  -\n");
+    parse(&input).unwrap().remove(0).journal
+}
+
+/// The common layout: the full name in `T2` and the abbreviation in `J2`. The full name wins.
+#[test]
+fn t2_preferred_over_j2() {
+    let journal = journal_of("T2  - Journal of Testing\nJ2  - J. Test.\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// The preferred tag wins even when a less preferred one comes first.
+#[test]
+fn preference_ignores_tag_order() {
+    let journal = journal_of("J2  - J. Test.\nT2  - Journal of Testing\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// `T2` on its own is read as the journal.
+#[test]
+fn t2_only() {
+    let journal = journal_of("T2  - Journal of Testing\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// `JF`, the full name, is preferred over `T2`.
+#[test]
+fn jf_preferred_over_t2() {
+    let journal = journal_of("T2  - Secondary Title\nJF  - Journal of Testing\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// `JO` is preferred over both abbreviation tags.
+#[test]
+fn jo_preferred_over_ja_and_j2() {
+    let journal = journal_of("JA  - J Test\nJ2  - J. Test.\nJO  - Journal of Testing\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// `JA` on its own is read as the journal.
+#[test]
+fn ja_only() {
+    let journal = journal_of("JA  - J Test\n");
+    assert_eq!(journal.as_deref(), Some("J Test"));
+}
+
+/// `J1`, the user abbreviation, is used only when no other journal tag is present.
+#[test]
+fn j1_is_last_fallback() {
+    assert_eq!(journal_of("J1  - JT\n").as_deref(), Some("JT"));
+    assert_eq!(
+        journal_of("J1  - JT\nJ2  - J. Test.\n").as_deref(),
+        Some("J. Test.")
+    );
+}
+
+/// `J2` on its own is read as the journal.
+#[test]
+fn j2_only() {
+    let journal = journal_of("J2  - J. Test.\n");
+    assert_eq!(journal.as_deref(), Some("J. Test."));
+}
+
+/// `JF` is preferred over `JO` whichever comes last.
+#[test]
+fn jf_preferred_over_jo_in_either_order() {
+    let full_name_first = journal_of("JF  - Journal of Testing\nJO  - J Test\n");
+    let full_name_last = journal_of("JO  - J Test\nJF  - Journal of Testing\n");
+    assert_eq!(full_name_first.as_deref(), Some("Journal of Testing"));
+    assert_eq!(full_name_last.as_deref(), Some("Journal of Testing"));
+}
+
+/// A journal name wrapped onto a continuation line is joined with a single space.
+#[test]
+fn journal_continuation_joined() {
+    let journal = journal_of("T2  - Journal of\nTesting and Verification\n");
+    assert_eq!(
+        journal.as_deref(),
+        Some("Journal of Testing and Verification")
+    );
+}
+
+/// A continuation line extends only the journal tag it follows.
+#[test]
+fn journal_continuation_appends_to_its_own_tag() {
+    let continued_full_name = journal_of("T2  - Journal of\nTesting\nJ2  - J. Test.\n");
+    assert_eq!(continued_full_name.as_deref(), Some("Journal of Testing"));
+
+    let continued_abbreviation = journal_of("T2  - Journal of Testing\nJ2  - J.\nTest.\n");
+    assert_eq!(
+        continued_abbreviation.as_deref(),
+        Some("Journal of Testing")
+    );
+}
+
+/// A blank tag does not hide a less preferred tag that has a value.
+#[test]
+fn blank_journal_tag_does_not_hide_less_preferred_tag() {
+    let journal = journal_of("T2  -\nJO  - Nature\n");
+    assert_eq!(journal.as_deref(), Some("Nature"));
+}
+
+/// A repeated journal tag replaces its own earlier value, even with a blank one, which then gives
+/// way to a less preferred tag.
+#[test]
+fn repeated_journal_tag_replaces_its_value() {
+    let replaced = journal_of("T2  - Old Title\nT2  - New Title\n");
+    assert_eq!(replaced.as_deref(), Some("New Title"));
+
+    let blanked = journal_of("T2  - Nature\nT2  -\nJ2  - Nat.\n");
+    assert_eq!(blanked.as_deref(), Some("Nat."));
+}
+
+/// A blank journal tag with nothing better is kept as an empty journal, as other blank tags are.
+#[test]
+fn blank_only_journal_tag_kept() {
+    let journal = journal_of("T2  -\n");
+    assert_eq!(journal.as_deref(), Some(""));
+}
+
 // -- Pages --
 
 #[test]
@@ -567,7 +700,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
 
 // -- Property-based tests --
 
-proptest! {
+proptest::proptest! {
     #[test]
     fn parse_never_panics(s in "\\PC{0,500}") {
         let _ = parse(&s);
@@ -614,4 +747,69 @@ proptest! {
         let input = format!("{prefix}{body}{suffix}");
         let _ = parse(&input);
     }
+}
+
+// -- Journal properties --
+
+/// Raw values that could follow a journal tag's separator, including the edge cases: empty,
+/// whitespace only (ASCII and Unicode), leading whitespace and long values. `\PC` excludes control
+/// characters, so a value never contains a line break.
+fn journal_value() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => "\\PC{1,60}",
+        1 => Just(String::new()),
+        1 => "[ \u{a0}\u{3000}\u{2028}]{1,5}",
+        1 => "[ \u{3000}]{1,3}\\PC{1,40}",
+        1 => "\\PC{200,400}",
+    ]
+}
+
+/// The journal tags of one record: distinct tags in any order, each with a raw value.
+#[derive(Arbitrary, Debug)]
+struct JournalTags {
+    /// Distinct journal tags, shuffled. Because no tag repeats, no value overwrites another.
+    #[strategy(subsequence(JOURNAL_TAGS.to_vec(), 1..=JOURNAL_TAGS.len()).prop_shuffle())]
+    tags: Vec<&'static str>,
+    /// One raw value for each entry in `tags`, in the same order.
+    #[strategy(vec(journal_value(), #tags.len()))]
+    values: Vec<String>,
+}
+
+/// A value under any journal tag parses to that value, without trailing whitespace.
+#[proptest]
+fn journal_from_any_tag(
+    #[strategy(select(JOURNAL_TAGS.to_vec()))] tag: &'static str,
+    #[strategy(journal_value())] value: String,
+) {
+    let journal = journal_of(&format!("{tag}  - {value}\n"));
+    prop_assert_eq!(journal.as_deref(), Some(value.trim_end()));
+}
+
+/// The parsed journal matches a direct reference: order the values by tag preference, then take
+/// the first non-blank value, or the first value if all are blank.
+#[proptest]
+fn journal_preference_matches_reference(input: JournalTags) {
+    let mut tag_lines = String::new();
+    for (tag, value) in input.tags.iter().zip(&input.values) {
+        writeln!(tag_lines, "{tag}  - {value}").unwrap();
+    }
+    let journal = journal_of(&tag_lines);
+
+    let mut by_preference: Vec<(usize, String)> = input
+        .tags
+        .into_iter()
+        .zip(input.values)
+        .map(|(tag, value)| {
+            let rank = JOURNAL_TAGS.iter().position(|t| *t == tag).unwrap();
+            (rank, value.trim_end().to_owned())
+        })
+        .collect();
+    by_preference.sort_by_key(|(rank, _)| *rank);
+    let expected = by_preference
+        .iter()
+        .find(|(_, value)| !value.is_empty())
+        .or(by_preference.first())
+        .map(|(_, value)| value.clone());
+
+    prop_assert_eq!(journal, expected);
 }

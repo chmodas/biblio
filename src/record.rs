@@ -82,7 +82,9 @@ pub struct Record {
     /// Publication date.
     pub date: Option<PublicationDate>,
 
-    /// Full journal or periodical name (e.g. `"Nature"`).
+    /// Journal, periodical or other containing work (e.g. `"Nature"`, or a book or proceedings
+    /// title). This is the full name where the source provides one, and otherwise an abbreviation
+    /// (e.g. from `RIS` `JA`, `J2` or `J1`).
     pub journal: Option<String>,
 
     /// Digital Object Identifier, without a URL prefix (e.g. `"10.1038/s41586-024-07386-0"`).

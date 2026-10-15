@@ -20,6 +20,14 @@ use crate::{Error, PublicationDate, Record};
 ///
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
 /// Returns [`Error::MissingRequiredField`] if a record lacks a title (`TI` or `T1`).
+///
+/// # Journal
+///
+/// The journal is read from `JF`, `T2`, `JO`, `JA`, `J2` and `J1`, preferring them in that order
+/// (full names before abbreviations) wherever they appear in the record. A tag with a blank value
+/// never hides a less preferred tag with a value; if every journal tag is blank, the journal is an
+/// empty string. `T2` is read for every record type, so for chapters, conference papers and books
+/// the journal may hold the book, proceedings or series title.
 pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
     check_empty(input)?;
     let input = normalize_line_endings(input);
@@ -204,6 +212,15 @@ fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> 
     Ok((tag, value.trim_end()))
 }
 
+/// The tags that carry a journal name, in order of preference: full names (`JF`, `T2`) first, then
+/// `JO`, then the abbreviations (`JA`, `J2`, and the user abbreviation `J1`).
+const JOURNAL_TAGS: [&str; 6] = ["JF", "T2", "JO", "JA", "J2", "J1"];
+
+/// Return the position of `tag` in [`JOURNAL_TAGS`], or `None` if it does not carry a journal.
+fn journal_index(tag: &str) -> Option<usize> {
+    JOURNAL_TAGS.iter().position(|t| *t == tag)
+}
+
 #[derive(Default)]
 struct RecordBuilder {
     line_start: usize,
@@ -211,7 +228,9 @@ struct RecordBuilder {
     t1_title: Option<String>,
     authors: Vec<String>,
     date: Option<PublicationDate>,
-    journal: Option<String>,
+    /// The value of each journal tag, indexed like [`JOURNAL_TAGS`]. The journal is chosen from
+    /// these in [`RecordBuilder::finish`].
+    journals: [Option<String>; JOURNAL_TAGS.len()],
     doi: Option<String>,
     start_page: Option<String>,
     end_page: Option<String>,
@@ -225,23 +244,26 @@ struct RecordBuilder {
 
 impl RecordBuilder {
     fn dispatch(&mut self, tag: &str, value: &str) {
-        match tag {
-            "TI" => self.ti_title = Some(value.to_owned()),
-            "T1" => self.t1_title = Some(value.to_owned()),
-            "AU" | "A1" => self.authors.push(value.to_owned()),
-            "PY" | "Y1" => self.date = parse_date(value),
-            "JO" | "JF" => self.journal = Some(value.to_owned()),
-            "DO" => self.doi = Some(value.to_owned()),
-            "SP" => self.start_page = Some(value.to_owned()),
-            "EP" => self.end_page = Some(value.to_owned()),
-            "VL" => self.volume = Some(value.to_owned()),
-            "IS" => self.number = Some(value.to_owned()),
-            "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
-            "SN" => self.isbn = Some(value.to_owned()),
-            "ID" => {
-                self.extras.insert(tag.to_owned(), value.to_owned());
+        if let Some(i) = journal_index(tag) {
+            self.journals[i] = Some(value.to_owned());
+        } else {
+            match tag {
+                "TI" => self.ti_title = Some(value.to_owned()),
+                "T1" => self.t1_title = Some(value.to_owned()),
+                "AU" | "A1" => self.authors.push(value.to_owned()),
+                "PY" | "Y1" => self.date = parse_date(value),
+                "DO" => self.doi = Some(value.to_owned()),
+                "SP" => self.start_page = Some(value.to_owned()),
+                "EP" => self.end_page = Some(value.to_owned()),
+                "VL" => self.volume = Some(value.to_owned()),
+                "IS" => self.number = Some(value.to_owned()),
+                "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
+                "SN" => self.isbn = Some(value.to_owned()),
+                "ID" => {
+                    self.extras.insert(tag.to_owned(), value.to_owned());
+                }
+                _ => {}
             }
-            _ => {}
         }
         self.last_tag = Some(tag.to_owned());
     }
@@ -250,6 +272,10 @@ impl RecordBuilder {
         let Some(tag) = self.last_tag.as_deref() else {
             return;
         };
+        if let Some(i) = journal_index(tag) {
+            append_to_opt(&mut self.journals[i], text);
+            return;
+        }
         match tag {
             "TI" => append_to_opt(&mut self.ti_title, text),
             "T1" => append_to_opt(&mut self.t1_title, text),
@@ -276,11 +302,19 @@ impl RecordBuilder {
             _ => None,
         };
 
+        // The first non-blank journal in order of preference. `min_by_key` keeps the first of equal
+        // keys, so if every journal tag is blank the most preferred one is kept as `Some("")`.
+        let journal = self
+            .journals
+            .into_iter()
+            .flatten()
+            .min_by_key(String::is_empty);
+
         Ok(Record {
             title,
             authors: self.authors,
             date: self.date,
-            journal: self.journal,
+            journal,
             doi: self.doi,
             pages,
             volume: self.volume,
