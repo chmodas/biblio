@@ -477,6 +477,39 @@ fn repeated_journal_tag_replaces_its_value() {
     assert_eq!(blanked.as_deref(), Some("Nat."));
 }
 
+/// A blank title continued on the next line becomes the continuation text, without a leading
+/// space.
+#[test]
+fn blank_title_continued_without_leading_space() {
+    let records = parse("TY  - JOUR\nTI  -\nA test title\nER  -\n").unwrap();
+    assert_eq!(records[0].title, "A test title");
+}
+
+/// A blank field continued over two lines joins the lines with a single space.
+#[test]
+fn blank_field_continued_over_two_lines() {
+    let journal = journal_of("T2  -\nJournal of\nTesting\n");
+    assert_eq!(journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// A blank journal tag continued on the next line becomes the continuation text, without a
+/// leading space.
+#[test]
+fn blank_journal_continued_without_leading_space() {
+    assert_eq!(
+        journal_of("T2  -\nJournal of Testing\n").as_deref(),
+        Some("Journal of Testing")
+    );
+}
+
+/// A blank author continued on the next line becomes the continuation text, without a leading
+/// space.
+#[test]
+fn blank_author_continued_without_leading_space() {
+    let records = parse("TY  - JOUR\nTI  - A test title\nAU  -\nDoe, Jane\nER  -\n").unwrap();
+    assert_eq!(records[0].authors, vec!["Doe, Jane"]);
+}
+
 /// A blank journal tag with nothing better is kept as an empty journal, as other blank tags are.
 #[test]
 fn blank_only_journal_tag_kept() {
@@ -818,4 +851,36 @@ fn journal_preference_matches_reference(input: JournalTags) {
         .map(|(_, value)| value.clone());
 
     prop_assert_eq!(journal, expected);
+}
+
+// -- Continuation properties --
+
+/// Text for a continuation line: no control characters, does not start with whitespace and has no
+/// `-`, so it is never blank and never read as a tag line.
+const CONTINUATION_TEXT: &str = "[^\\s\\p{C}-][^\\p{C}-]{0,59}";
+
+/// A blank field of any continuable tag, continued on the next line, becomes exactly the trimmed
+/// continuation text.
+#[proptest]
+fn blank_field_continued_is_continuation_text(
+    #[strategy(select(&["TI", "T1", "AB", "N2", "AU", "A1", "JF", "T2", "JO", "JA", "J2", "J1"]))]
+    tag: &'static str,
+    #[strategy(CONTINUATION_TEXT)] text: String,
+) {
+    // A title tag must be the only title, so that the blank one is the one read.
+    let title = if matches!(tag, "TI" | "T1") {
+        ""
+    } else {
+        "TI  - t\n"
+    };
+    let input = format!("TY  - JOUR\n{title}{tag}  -\n{text}\nER  -\n");
+    let record = parse(&input).unwrap().remove(0);
+
+    let field = match tag {
+        "TI" | "T1" => Some(record.title),
+        "AB" | "N2" => record.abstract_text,
+        "AU" | "A1" => record.authors.last().cloned(),
+        _ => record.journal,
+    };
+    prop_assert_eq!(field.as_deref(), Some(text.trim()));
 }
