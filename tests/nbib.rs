@@ -308,6 +308,29 @@ AU  - Very Long Author Name That
     );
 }
 
+/// A blank title continued on the next line becomes the continuation text, without a leading
+/// space.
+#[test]
+fn blank_title_continued_without_leading_space() {
+    let records = parse("TI  - \n      A test title\n").unwrap();
+    assert_eq!(records[0].title, "A test title");
+}
+
+/// A blank author continued on the next line becomes the continuation text, without a leading
+/// space.
+#[test]
+fn blank_author_continued_without_leading_space() {
+    let records = parse("TI  - A test title\nFAU - \n      Doe, Jane\n").unwrap();
+    assert_eq!(records[0].authors, vec!["Doe, Jane"]);
+}
+
+/// A blank `LID` continued with a DOI on the next line gives the DOI without a leading space.
+#[test]
+fn blank_lid_continued_gives_doi() {
+    let records = parse("TI  - A test title\nLID - \n      10.1000/xyz123 [doi]\n").unwrap();
+    assert_eq!(records[0].doi.as_deref(), Some("10.1000/xyz123"));
+}
+
 #[test]
 fn continuation_lines_lid() {
     let input = "\
@@ -517,4 +540,26 @@ fn adversarial_parse_no_panic(
 ) {
     let input = format!("{prefix}{body}{suffix}");
     let _ = parse(&input);
+}
+
+// -- Continuation properties --
+
+/// A blank field of any continuable tag, continued on an indented line, becomes exactly the
+/// trimmed continuation text.
+#[proptest]
+fn blank_field_continued_is_continuation_text(
+    #[strategy(select(&["TI", "AB", "JT", "FAU", "AU"]))] tag: &'static str,
+    #[strategy("[^\\s\\p{C}]\\PC{0,59}")] text: String,
+) {
+    // The leading title makes the record valid for every tag; a blank `TI` replaces it.
+    let input = format!("TI  - t\n{tag:<4}- \n      {text}\n");
+    let record = parse(&input).unwrap().remove(0);
+
+    let field = match tag {
+        "TI" => Some(record.title),
+        "AB" => record.abstract_text,
+        "JT" => record.journal,
+        _ => record.authors.last().cloned(),
+    };
+    prop_assert_eq!(field.as_deref(), Some(text.trim()));
 }
