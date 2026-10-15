@@ -700,53 +700,59 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
 
 // -- Property-based tests --
 
-proptest::proptest! {
-    #[test]
-    fn parse_never_panics(s in "\\PC{0,500}") {
-        let _ = parse(&s);
-    }
+/// Parsing arbitrary printable text never panics.
+#[proptest]
+fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
+    let _ = parse(&s);
+}
 
-    #[test]
-    fn date_round_trip(date in arb_date()) {
-        let formatted = format_ris_date(date);
-        let reparsed = parse(&format!("TY  - JOUR\nTI  - t\nPY  - {formatted}\nER  -\n"))
-            .unwrap()[0]
-            .date
-            .unwrap();
-        prop_assert_eq!(date, reparsed);
-    }
+/// A date written in the `RIS` date format parses back to the same date.
+#[proptest]
+fn date_round_trip(#[strategy(arb_date())] date: PublicationDate) {
+    let formatted = format_ris_date(date);
+    let reparsed = parse(&format!("TY  - JOUR\nTI  - t\nPY  - {formatted}\nER  -\n")).unwrap()[0]
+        .date
+        .unwrap();
+    prop_assert_eq!(date, reparsed);
+}
 
-    #[test]
-    fn serialize_round_trip(record in arb_ris_record()) {
-        let serialized = serialize(std::slice::from_ref(&record));
-        let reparsed = parse(&serialized).unwrap();
-        prop_assert_eq!(vec![record], reparsed);
-    }
+/// Serialising a record and parsing the output gives back the same record.
+#[proptest]
+fn serialize_round_trip(#[strategy(arb_ris_record())] record: Record) {
+    let serialized = serialize(std::slice::from_ref(&record));
+    let reparsed = parse(&serialized).unwrap();
+    prop_assert_eq!(vec![record], reparsed);
+}
 
-    #[test]
-    fn adversarial_values_round_trip(
-        tag_like in prop::sample::select(&["TI  - nested", "AU  - trap", "ER  -"]),
-        padding in "[A-Za-z ]{1,20}",
-    ) {
-        let title = format!("{padding} {tag_like} {padding}").trim_end().to_owned();
-        let record = Record {
-            title,
-            ..Default::default()
-        };
-        let serialized = serialize(std::slice::from_ref(&record));
-        let reparsed = parse(&serialized).unwrap();
-        prop_assert_eq!(vec![record], reparsed);
-    }
+/// Values containing tag-like text survive a round trip, because that text appears mid-line,
+/// not at the start of a line.
+#[proptest]
+fn adversarial_values_round_trip(
+    #[strategy(select(&["TI  - nested", "AU  - trap", "ER  -"]))] tag_like: &'static str,
+    #[strategy("[A-Za-z ]{1,20}")] padding: String,
+) {
+    let title = format!("{padding} {tag_like} {padding}")
+        .trim_end()
+        .to_owned();
+    let record = Record {
+        title,
+        ..Default::default()
+    };
+    let serialized = serialize(std::slice::from_ref(&record));
+    let reparsed = parse(&serialized).unwrap();
+    prop_assert_eq!(vec![record], reparsed);
+}
 
-    #[test]
-    fn adversarial_parse_no_panic(
-        prefix in "(TY  - JOUR\n|TI  - |AU  - |ER  -\n|\\r\\n|\n){0,5}",
-        body in "\\PC{0,200}",
-        suffix in "(\n\n|\r\n\r\n|\n){0,3}",
-    ) {
-        let input = format!("{prefix}{body}{suffix}");
-        let _ = parse(&input);
-    }
+/// Parsing arbitrary text wrapped in fragments of `RIS` syntax (record and field openers,
+/// closers and line endings) never panics.
+#[proptest]
+fn adversarial_parse_no_panic(
+    #[strategy("(TY  - JOUR\n|TI  - |AU  - |ER  -\n|\\r\\n|\n){0,5}")] prefix: String,
+    #[strategy("\\PC{0,200}")] body: String,
+    #[strategy("(\n\n|\r\n\r\n|\n){0,3}")] suffix: String,
+) {
+    let input = format!("{prefix}{body}{suffix}");
+    let _ = parse(&input);
 }
 
 // -- Journal properties --

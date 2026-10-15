@@ -2,6 +2,7 @@ mod common;
 
 use proptest::prelude::*;
 use std::collections::HashMap;
+use test_strategy::proptest;
 
 use biblio::endnote_xml::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
@@ -434,26 +435,28 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
 
 // -- Property-based tests --
 
-proptest! {
-    #[test]
-    fn parse_never_panics(s in "\\PC{0,500}") {
-        let _ = parse(&s);
-    }
+/// Parsing arbitrary printable text never panics.
+#[proptest]
+fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
+    let _ = parse(&s);
+}
 
-    #[test]
-    fn serialize_round_trip(record in arb_endnote_record()) {
-        let serialized = serialize(std::slice::from_ref(&record));
-        let reparsed = parse(&serialized).unwrap();
-        prop_assert_eq!(vec![record], reparsed);
-    }
+/// Serialising a record and parsing the output gives back the same record.
+#[proptest]
+fn serialize_round_trip(#[strategy(arb_endnote_record())] record: Record) {
+    let serialized = serialize(std::slice::from_ref(&record));
+    let reparsed = parse(&serialized).unwrap();
+    prop_assert_eq!(vec![record], reparsed);
+}
 
-    #[test]
-    fn adversarial_parse_no_panic(
-        prefix in "(<xml>|<records>|<record>|</){0,5}",
-        body in "\\PC{0,200}",
-        suffix in "(</record>|</records>|</xml>){0,3}",
-    ) {
-        let input = format!("{prefix}{body}{suffix}");
-        let _ = parse(&input);
-    }
+/// Parsing arbitrary text wrapped in fragments of `EndNote XML` syntax (element openers and
+/// closers) never panics.
+#[proptest]
+fn adversarial_parse_no_panic(
+    #[strategy("(<xml>|<records>|<record>|</){0,5}")] prefix: String,
+    #[strategy("\\PC{0,200}")] body: String,
+    #[strategy("(</record>|</records>|</xml>){0,3}")] suffix: String,
+) {
+    let input = format!("{prefix}{body}{suffix}");
+    let _ = parse(&input);
 }

@@ -1,7 +1,9 @@
 mod common;
 
 use proptest::prelude::*;
+use proptest::sample::select;
 use std::collections::HashMap;
+use test_strategy::proptest;
 
 use biblio::nbib::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
@@ -462,55 +464,57 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
 
 // -- Property-based tests --
 
-proptest! {
-    #[test]
-    fn parse_never_panics(s in "\\PC{0,500}") {
-        let _ = parse(&s);
-    }
+/// Parsing arbitrary printable text never panics.
+#[proptest]
+fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
+    let _ = parse(&s);
+}
 
-    #[test]
-    fn date_round_trip(date in arb_date()) {
-        let formatted = format_nbib_date(date);
-        let reparsed = parse(&format!("TI  - t\nDP  - {formatted}\n"))
-            .unwrap()[0]
-            .date
-            .unwrap();
-        prop_assert_eq!(date, reparsed);
-    }
+/// A date written in the `NBIB` date format parses back to the same date.
+#[proptest]
+fn date_round_trip(#[strategy(arb_date())] date: PublicationDate) {
+    let formatted = format_nbib_date(date);
+    let reparsed = parse(&format!("TI  - t\nDP  - {formatted}\n")).unwrap()[0]
+        .date
+        .unwrap();
+    prop_assert_eq!(date, reparsed);
+}
 
-    #[test]
-    fn serialize_round_trip(record in arb_nbib_record()) {
-        let serialized = serialize(std::slice::from_ref(&record));
-        let reparsed = parse(&serialized).unwrap();
-        prop_assert_eq!(vec![record], reparsed);
-    }
+/// Serialising a record and parsing the output gives back the same record.
+#[proptest]
+fn serialize_round_trip(#[strategy(arb_nbib_record())] record: Record) {
+    let serialized = serialize(std::slice::from_ref(&record));
+    let reparsed = parse(&serialized).unwrap();
+    prop_assert_eq!(vec![record], reparsed);
+}
 
-    /// Values containing tag-like patterns (e.g. "TI  - nested") must
-    /// survive round-trip because they appear mid-line, not at line start.
-    #[test]
-    fn adversarial_values_round_trip(
-        tag_like in prop::sample::select(&["TI  - nested", "AB  - trap", "PMID- 999"]),
-        padding in "[A-Za-z ]{1,20}",
-    ) {
-        let title = format!("{padding} {tag_like} {padding}").trim_end().to_owned();
-        let record = Record {
-            title,
-            ..Default::default()
-        };
-        let serialized = serialize(std::slice::from_ref(&record));
-        let reparsed = parse(&serialized).unwrap();
-        prop_assert_eq!(vec![record], reparsed);
-    }
+/// Values containing tag-like text survive a round trip, because that text appears mid-line,
+/// not at the start of a line.
+#[proptest]
+fn adversarial_values_round_trip(
+    #[strategy(select(&["TI  - nested", "AB  - trap", "PMID- 999"]))] tag_like: &'static str,
+    #[strategy("[A-Za-z ]{1,20}")] padding: String,
+) {
+    let title = format!("{padding} {tag_like} {padding}")
+        .trim_end()
+        .to_owned();
+    let record = Record {
+        title,
+        ..Default::default()
+    };
+    let serialized = serialize(std::slice::from_ref(&record));
+    let reparsed = parse(&serialized).unwrap();
+    prop_assert_eq!(vec![record], reparsed);
+}
 
-    /// Parsing adversarial input must never panic, even with embedded
-    /// tag separators, fake continuation lines, and mixed line endings.
-    #[test]
-    fn adversarial_parse_no_panic(
-        prefix in "(TI  - |FAU - |AB  - |PMID- |      |\\r\\n|\n){0,5}",
-        body in "\\PC{0,200}",
-        suffix in "(\n\n|\r\n\r\n|\n){0,3}",
-    ) {
-        let input = format!("{prefix}{body}{suffix}");
-        let _ = parse(&input);
-    }
+/// Parsing arbitrary text wrapped in fragments of `NBIB` syntax (tag openers, continuation
+/// indents, blank-line record separators and mixed line endings) never panics.
+#[proptest]
+fn adversarial_parse_no_panic(
+    #[strategy("(TI  - |FAU - |AB  - |PMID- |      |\\r\\n|\n){0,5}")] prefix: String,
+    #[strategy("\\PC{0,200}")] body: String,
+    #[strategy("(\n\n|\r\n\r\n|\n){0,3}")] suffix: String,
+) {
+    let input = format!("{prefix}{body}{suffix}");
+    let _ = parse(&input);
 }
