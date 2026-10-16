@@ -99,7 +99,7 @@ fn misc_entry_type() {
 ";
     let records = parse(input).unwrap();
     assert_eq!(records[0].title, "A website resource");
-    assert!(records[0].authors.is_empty());
+    assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
 // -- Authors --
@@ -113,7 +113,7 @@ fn no_authors() {
 }
 ";
     let records = parse(input).unwrap();
-    assert!(records[0].authors.is_empty());
+    assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
 #[test]

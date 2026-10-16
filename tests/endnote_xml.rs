@@ -222,7 +222,7 @@ fn no_contributors() {
 </records></xml>";
 
     let records = parse(input).unwrap();
-    assert!(records[0].authors.is_empty());
+    assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
 // -- Dates --
