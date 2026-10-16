@@ -12,7 +12,9 @@ use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
-use crate::parse_util::{append_to_last, append_to_opt, check_empty, normalize_line_endings};
+use crate::parse_util::{
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+};
 use crate::{Error, PublicationDate, Record};
 
 /// Parse `NBIB`-formatted text into zero or more [`Record`]s.
@@ -20,7 +22,14 @@ use crate::{Error, PublicationDate, Record};
 /// # Errors
 ///
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
-/// Returns [`Error::MissingRequiredField`] if a record lacks a `TI` (title) field.
+/// Returns [`Error::MissingRequiredField`] if a record lacks a title (`TI` or `BTI`).
+///
+/// # Title and journal
+///
+/// The title is read from `TI`, falling back to the book title (`BTI`) for books, which have no
+/// `TI`. The journal is read from `JT`, falling back to the collection title (`CTI`), the series a
+/// book belongs to. The collection title is never used as a title, because unrelated books in the
+/// same series share it. A blank tag never hides its fallback when the fallback has a value.
 pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
     check_empty(input)?;
     let input = normalize_line_endings(input);
@@ -232,10 +241,15 @@ fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> 
 struct RecordBuilder {
     line_start: usize,
     title: Option<String>,
+    /// Book title (`BTI`), the title of a book, which has no `TI`.
+    book_title: Option<String>,
     fau_authors: Vec<String>,
     au_authors: Vec<String>,
     date: Option<PublicationDate>,
     journal: Option<String>,
+    /// Collection title (`CTI`), the series a book belongs to. Used as the journal when there is
+    /// no `JT`.
+    collection_title: Option<String>,
     doi_candidates: Vec<String>,
     pages: Option<String>,
     volume: Option<String>,
@@ -250,6 +264,8 @@ impl RecordBuilder {
     fn dispatch(&mut self, tag: &str, value: &str) {
         match tag {
             "TI" => self.title = Some(value.to_owned()),
+            "BTI" => self.book_title = Some(value.to_owned()),
+            "CTI" => self.collection_title = Some(value.to_owned()),
             "FAU" => self.fau_authors.push(value.to_owned()),
             "AU" => self.au_authors.push(value.to_owned()),
             "DP" => self.date = parse_date(value),
@@ -274,6 +290,8 @@ impl RecordBuilder {
         };
         match tag {
             "TI" => append_to_opt(&mut self.title, text),
+            "BTI" => append_to_opt(&mut self.book_title, text),
+            "CTI" => append_to_opt(&mut self.collection_title, text),
             "AB" => append_to_opt(&mut self.abstract_text, text),
             "JT" => append_to_opt(&mut self.journal, text),
             "FAU" => append_to_last(&mut self.fau_authors, text),
@@ -284,10 +302,11 @@ impl RecordBuilder {
     }
 
     fn finish(self) -> Result<Record, Error> {
-        let title = self.title.ok_or(Error::MissingRequiredField {
-            tag: "TI",
-            line: self.line_start,
-        })?;
+        let title =
+            first_non_blank([self.title, self.book_title]).ok_or(Error::MissingRequiredField {
+                tag: "TI",
+                line: self.line_start,
+            })?;
 
         let authors = if self.fau_authors.is_empty() {
             self.au_authors
@@ -301,7 +320,7 @@ impl RecordBuilder {
             title,
             authors,
             date: self.date,
-            journal: self.journal,
+            journal: first_non_blank([self.journal, self.collection_title]),
             doi,
             pages: self.pages,
             volume: self.volume,

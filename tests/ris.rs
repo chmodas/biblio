@@ -10,7 +10,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::ris::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_text, arb_volume};
+use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume};
 
 // -- Core parsing --
 
@@ -790,19 +790,6 @@ fn adversarial_parse_no_panic(
 
 // -- Journal properties --
 
-/// Raw values that could follow a journal tag's separator, including the edge cases: empty,
-/// whitespace only (ASCII and Unicode), leading whitespace and long values. `\PC` excludes control
-/// characters, so a value never contains a line break.
-fn journal_value() -> impl Strategy<Value = String> {
-    prop_oneof![
-        4 => "\\PC{1,60}",
-        1 => Just(String::new()),
-        1 => "[ \u{a0}\u{3000}\u{2028}]{1,5}",
-        1 => "[ \u{3000}]{1,3}\\PC{1,40}",
-        1 => "\\PC{200,400}",
-    ]
-}
-
 /// The journal tags of one record: distinct tags in any order, each with a raw value.
 #[derive(Arbitrary, Debug)]
 struct JournalTags {
@@ -810,7 +797,7 @@ struct JournalTags {
     #[strategy(subsequence(JOURNAL_TAGS.to_vec(), 1..=JOURNAL_TAGS.len()).prop_shuffle())]
     tags: Vec<&'static str>,
     /// One raw value for each entry in `tags`, in the same order.
-    #[strategy(vec(journal_value(), #tags.len()))]
+    #[strategy(vec(arb_raw_value(), #tags.len()))]
     values: Vec<String>,
 }
 
@@ -818,7 +805,7 @@ struct JournalTags {
 #[proptest]
 fn journal_from_any_tag(
     #[strategy(select(JOURNAL_TAGS.to_vec()))] tag: &'static str,
-    #[strategy(journal_value())] value: String,
+    #[strategy(arb_raw_value())] value: String,
 ) {
     let journal = journal_of(&format!("{tag}  - {value}\n"));
     prop_assert_eq!(journal.as_deref(), Some(value.trim_end()));

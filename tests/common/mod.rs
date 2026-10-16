@@ -51,3 +51,17 @@ pub fn arb_volume() -> impl Strategy<Value = String> {
         "Suppl [0-9]",
     ]
 }
+
+/// Raw values that could follow a tag's separator, including the edge cases: empty, whitespace
+/// only (ASCII and Unicode), leading whitespace and long values. `\PC` excludes control characters,
+/// so a value never contains a line break. Parsers trim the end of a value, so the expected parsed
+/// value is `value.trim_end()`.
+pub fn arb_raw_value() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => "\\PC{1,60}",
+        1 => Just(String::new()),
+        1 => "[ \u{a0}\u{3000}\u{2028}]{1,5}",
+        1 => "[ \u{3000}]{1,3}\\PC{1,40}",
+        1 => "\\PC{200,400}",
+    ]
+}

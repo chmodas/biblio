@@ -44,3 +44,16 @@ fn push_continuation(existing: &mut String, text: &str) {
     }
     existing.push_str(text);
 }
+
+/// Return the first non-blank candidate, in the order given.
+///
+/// If every present candidate is blank, the first of them is returned, so a blank tag on its own
+/// is kept as an empty value; if none is present, the result is `None`. Tag values are trimmed at
+/// the end and continuation text is fully trimmed, so a blank value is always empty.
+pub(crate) fn first_non_blank<const N: usize>(candidates: [Option<String>; N]) -> Option<String> {
+    // `min_by_key` keeps the first of equal keys, and `false` (non-empty) sorts before `true`.
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(String::is_empty)
+}
