@@ -11,7 +11,9 @@ use std::fmt::Write as _;
 use winnow::Parser;
 use winnow::token::{rest, take_while};
 
-use crate::parse_util::{append_to_last, append_to_opt, check_empty, normalize_line_endings};
+use crate::parse_util::{
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+};
 use crate::{Error, PublicationDate, Record};
 
 /// Parse `RIS`-formatted text into zero or more [`Record`]s.
@@ -302,13 +304,7 @@ impl RecordBuilder {
             _ => None,
         };
 
-        // The first non-blank journal in order of preference. `min_by_key` keeps the first of equal
-        // keys, so if every journal tag is blank the most preferred one is kept as `Some("")`.
-        let journal = self
-            .journals
-            .into_iter()
-            .flatten()
-            .min_by_key(String::is_empty);
+        let journal = first_non_blank(self.journals);
 
         Ok(Record {
             title,

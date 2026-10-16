@@ -1,14 +1,16 @@
 mod common;
 
+use proptest::collection::vec;
 use proptest::prelude::*;
-use proptest::sample::select;
+use proptest::sample::{select, subsequence};
 use std::collections::HashMap;
-use test_strategy::proptest;
+use std::fmt::Write as _;
+use test_strategy::{Arbitrary, proptest};
 
 use biblio::nbib::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_text, arb_volume};
+use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume};
 
 // -- Core parsing --
 
@@ -187,6 +189,73 @@ AU  - Smith J
 
     let records = parse(input).unwrap();
     assert_eq!(records[0].authors, vec!["Doe J", "Smith J"]);
+}
+
+// -- Books --
+
+/// A book record has no `TI` or `JT`: its title is the book title (`BTI`), here wrapped over two
+/// continuation lines, and its journal is the collection title (`CTI`). It parses alongside an
+/// ordinary article.
+#[test]
+fn book_record_title_and_series() {
+    let input = "\
+PMID- 10000001
+TI  - An ordinary article
+JT  - Journal of Testing
+
+PMID- 10000002
+PT  - Book
+CTI - Reports in Testing
+DP  - 2021 Nov
+BTI - A very long book title that
+      wraps onto a second line and
+      then a third.
+FAU - Doe, Jane
+";
+    let records = parse(input).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].title, "An ordinary article");
+    assert_eq!(
+        records[1].title,
+        "A very long book title that wraps onto a second line and then a third."
+    );
+    assert_eq!(records[1].journal.as_deref(), Some("Reports in Testing"));
+    assert_eq!(records[1].authors, vec!["Doe, Jane"]);
+}
+
+/// In a chapter record, `TI` holds the chapter title and is preferred over the book title.
+#[test]
+fn ti_preferred_over_bti() {
+    let records = parse("BTI - The Book\nTI  - The Chapter\n").unwrap();
+    assert_eq!(records[0].title, "The Chapter");
+}
+
+/// `JT` is preferred over the collection title.
+#[test]
+fn jt_preferred_over_cti() {
+    let records = parse("TI  - t\nCTI - Reports in Testing\nJT  - Journal of Testing\n").unwrap();
+    assert_eq!(records[0].journal.as_deref(), Some("Journal of Testing"));
+}
+
+/// A blank `TI` does not hide a book title that has a value.
+#[test]
+fn blank_ti_does_not_hide_bti() {
+    let records = parse("TI  - \nBTI - The Book\n").unwrap();
+    assert_eq!(records[0].title, "The Book");
+}
+
+/// A blank `JT` does not hide a collection title that has a value.
+#[test]
+fn blank_jt_does_not_hide_cti() {
+    let records = parse("TI  - t\nJT  - \nCTI - Reports in Testing\n").unwrap();
+    assert_eq!(records[0].journal.as_deref(), Some("Reports in Testing"));
+}
+
+/// The collection title is shared by unrelated books, so it is never used as a title.
+#[test]
+fn collection_title_is_not_a_title() {
+    let err = parse("CTI - Reports in Testing\nDP  - 2024\n").unwrap_err();
+    assert!(matches!(err, Error::MissingRequiredField { tag: "TI", .. }));
 }
 
 // -- DOI extraction --
@@ -548,18 +617,74 @@ fn adversarial_parse_no_panic(
 /// trimmed continuation text.
 #[proptest]
 fn blank_field_continued_is_continuation_text(
-    #[strategy(select(&["TI", "AB", "JT", "FAU", "AU"]))] tag: &'static str,
+    #[strategy(select(&["TI", "BTI", "CTI", "AB", "JT", "FAU", "AU"]))] tag: &'static str,
     #[strategy("[^\\s\\p{C}]\\PC{0,59}")] text: String,
 ) {
-    // The leading title makes the record valid for every tag; a blank `TI` replaces it.
-    let input = format!("TI  - t\n{tag:<4}- \n      {text}\n");
+    // The leading title makes the record valid for every tag, and a blank `TI` replaces it. A book
+    // title gets no leading title, because a non-blank `TI` would be preferred over it.
+    let title = if tag == "BTI" { "" } else { "TI  - t\n" };
+    let input = format!("{title}{tag:<4}- \n      {text}\n");
     let record = parse(&input).unwrap().remove(0);
 
     let field = match tag {
-        "TI" => Some(record.title),
+        "TI" | "BTI" => Some(record.title),
         "AB" => record.abstract_text,
-        "JT" => record.journal,
+        "JT" | "CTI" => record.journal,
         _ => record.authors.last().cloned(),
     };
     prop_assert_eq!(field.as_deref(), Some(text.trim()));
+}
+
+// -- Fallback properties --
+
+/// A preferred tag and its fallback, in any order and possibly with only one of them, each with a
+/// raw value.
+#[derive(Arbitrary, Debug)]
+struct FallbackTags {
+    /// The preferred tag followed by its fallback: the title (`TI`, `BTI`) or the journal (`JT`,
+    /// `CTI`).
+    #[strategy(select(&[["TI", "BTI"], ["JT", "CTI"]]))]
+    pair: [&'static str; 2],
+    /// One or both tags of `pair`, shuffled. No tag repeats, so no value overwrites another.
+    #[strategy(subsequence(#pair.to_vec(), 1..=2).prop_shuffle())]
+    tags: Vec<&'static str>,
+    /// One raw value for each entry in `tags`, in the same order.
+    #[strategy(vec(arb_raw_value(), #tags.len()))]
+    values: Vec<String>,
+}
+
+/// The parsed title or journal matches a direct reference: order the values by preference, then
+/// take the first non-blank value, or the first value if all are blank.
+#[proptest]
+fn fallback_matches_reference(input: FallbackTags) {
+    let is_title = input.pair[0] == "TI";
+    // A journal record needs a title to parse.
+    let mut text = String::from(if is_title { "" } else { "TI  - t\n" });
+    for (tag, value) in input.tags.iter().zip(&input.values) {
+        writeln!(text, "{tag:<4}- {value}").unwrap();
+    }
+    let record = parse(&text).unwrap().remove(0);
+    let parsed = if is_title {
+        Some(record.title)
+    } else {
+        record.journal
+    };
+
+    let mut by_preference: Vec<(usize, String)> = input
+        .tags
+        .into_iter()
+        .zip(input.values)
+        .map(|(tag, value)| {
+            let rank = input.pair.iter().position(|t| *t == tag).unwrap();
+            (rank, value.trim_end().to_owned())
+        })
+        .collect();
+    by_preference.sort_by_key(|(rank, _)| *rank);
+    let expected = by_preference
+        .iter()
+        .find(|(_, value)| !value.is_empty())
+        .or(by_preference.first())
+        .map(|(_, value)| value.clone());
+
+    prop_assert_eq!(parsed, expected);
 }
