@@ -1,8 +1,11 @@
 mod common;
 
+use proptest::collection::vec;
 use proptest::prelude::*;
+use proptest::sample::subsequence;
 use std::collections::HashMap;
-use test_strategy::proptest;
+use std::fmt::Write as _;
+use test_strategy::{Arbitrary, proptest};
 
 use biblio::bibtex::{parse, serialize};
 use biblio::{Error, PublicationDate, Record};
@@ -316,6 +319,58 @@ fn journal_fallback() {
     assert_eq!(records[0].journal.as_deref(), Some("Science"));
 }
 
+// -- Identifiers --
+
+/// Parse a single entry whose fields, after the title, are `field_lines`, and return its
+/// identifier.
+fn identifier_of(field_lines: &str) -> Option<String> {
+    let input = format!("@article{{k,\n  title = {{t}},\n{field_lines}}}\n");
+    parse(&input).unwrap().remove(0).isbn
+}
+
+/// An entry with only an ISSN gets it as its identifier.
+#[test]
+fn issn_read_when_no_isbn() {
+    assert_eq!(
+        identifier_of("  issn = {1234-5678},\n").as_deref(),
+        Some("1234-5678")
+    );
+}
+
+/// The ISBN is preferred over the ISSN, whichever comes first.
+#[test]
+fn isbn_preferred_over_issn() {
+    let isbn_first = identifier_of("  isbn = {978-3-16-148410-0},\n  issn = {1234-5678},\n");
+    let isbn_last = identifier_of("  issn = {1234-5678},\n  isbn = {978-3-16-148410-0},\n");
+    assert_eq!(isbn_first.as_deref(), Some("978-3-16-148410-0"));
+    assert_eq!(isbn_last.as_deref(), Some("978-3-16-148410-0"));
+}
+
+/// An empty or whitespace-only ISBN does not hide an ISSN that has a value.
+#[test]
+fn blank_isbn_does_not_hide_issn() {
+    let empty = identifier_of("  isbn = {},\n  issn = {1234-5678},\n");
+    let spaces = identifier_of("  isbn = { },\n  issn = {1234-5678},\n");
+    assert_eq!(empty.as_deref(), Some("1234-5678"));
+    assert_eq!(spaces.as_deref(), Some("1234-5678"));
+}
+
+/// Field names are case-insensitive, so `ISSN` is read like `issn`.
+#[test]
+fn issn_field_name_case_insensitive() {
+    assert_eq!(
+        identifier_of("  ISSN = {1234-5678},\n").as_deref(),
+        Some("1234-5678")
+    );
+}
+
+/// A field listing several ISSNs is kept as one string, not split.
+#[test]
+fn several_issns_kept_verbatim() {
+    let identifier = identifier_of("  issn = {1234-5678, 2345-6789},\n");
+    assert_eq!(identifier.as_deref(), Some("1234-5678, 2345-6789"));
+}
+
 // -- Extras --
 
 #[test]
@@ -605,4 +660,67 @@ fn adversarial_parse_no_panic(
 ) {
     let input = format!("{prefix}{body}{suffix}");
     let _ = parse(&input);
+}
+
+// -- Identifier properties --
+
+/// Identifier values as they appear in exports: single ISSNs and ISBN-13s, pairs of them, empty,
+/// whitespace only, and padded. They contain no braces, `--`, `~`, `\` or repeated inner spaces,
+/// which the parser rewrites, so a parsed value is the generated value trimmed.
+fn identifier_value() -> impl Strategy<Value = String> {
+    let serial_number = "[0-9]{4}-[0-9]{3}[0-9X]";
+    let book_number = "97[89]-[0-9]{1,5}-[0-9]{1,7}-[0-9]{1,6}-[0-9X]";
+    let single = prop_oneof![serial_number, book_number];
+    let pair = (
+        single.clone(),
+        prop_oneof![Just(", "), Just(" ")],
+        single.clone(),
+    )
+        .prop_map(|(a, separator, b)| format!("{a}{separator}{b}"));
+    let padded = ("[ ]{1,2}", single.clone(), "[ ]{1,2}")
+        .prop_map(|(before, value, after)| format!("{before}{value}{after}"));
+    prop_oneof![
+        3 => single,
+        1 => pair,
+        1 => Just(String::new()),
+        1 => "[ ]{1,3}",
+        1 => padded,
+    ]
+}
+
+/// The identifier fields of one entry: `isbn`, `issn` or both, in any order, each with a value.
+#[derive(Arbitrary, Debug)]
+struct IdentifierFields {
+    /// One or both identifier fields, shuffled. No field repeats.
+    #[strategy(subsequence(vec!["isbn", "issn"], 1..=2).prop_shuffle())]
+    fields: Vec<&'static str>,
+    /// One value for each entry in `fields`, in the same order.
+    #[strategy(vec(identifier_value(), #fields.len()))]
+    values: Vec<String>,
+}
+
+/// The parsed identifier matches a direct reference: trim the values, put `isbn` before `issn`,
+/// then take the first non-blank value, or the first value if all are blank.
+#[proptest]
+fn identifier_fallback_matches_reference(input: IdentifierFields) {
+    let mut field_lines = String::new();
+    for (field, value) in input.fields.iter().zip(&input.values) {
+        writeln!(field_lines, "  {field} = {{{value}}},").unwrap();
+    }
+    let identifier = identifier_of(&field_lines);
+
+    let mut by_preference: Vec<(&str, String)> = input
+        .fields
+        .into_iter()
+        .zip(input.values)
+        .map(|(field, value)| (field, value.trim().to_owned()))
+        .collect();
+    by_preference.sort_by_key(|(field, _)| *field != "isbn");
+    let expected = by_preference
+        .iter()
+        .find(|(_, value)| !value.is_empty())
+        .or(by_preference.first())
+        .map(|(_, value)| value.clone());
+
+    prop_assert_eq!(identifier, expected);
 }

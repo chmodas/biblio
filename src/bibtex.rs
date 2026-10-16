@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use biblatex::{Bibliography, ChunksExt, Date, DateValue, PermissiveType, Person};
 
-use crate::parse_util::check_empty;
+use crate::parse_util::{check_empty, first_non_blank};
 use crate::{Error, PublicationDate, Record};
 
 /// Parse `BibTeX`/`BibLaTeX` text into zero or more [`Record`]s.
@@ -23,6 +23,13 @@ use crate::{Error, PublicationDate, Record};
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
 /// Returns [`Error::MalformedSyntax`] if the input cannot be parsed.
 /// Returns [`Error::MissingRequiredField`] if an entry has no title.
+///
+/// # Identifiers
+///
+/// The identifier is read from `isbn`, falling back to `issn`. A blank `isbn` never hides an `issn`
+/// with a value. The value is trimmed but not split or normalised, so a field listing several
+/// identifiers stays one string; the underlying parser still collapses whitespace and turns `--`
+/// into a dash.
 pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
     check_empty(input)?;
 
@@ -161,7 +168,12 @@ fn record_from_entry(entry: &biblatex::Entry) -> Result<Record, Error> {
 
     let number = entry.get("number").map(ChunksExt::format_verbatim);
     let abstract_text = entry.get("abstract").map(ChunksExt::format_verbatim);
-    let isbn = entry.get("isbn").map(ChunksExt::format_verbatim);
+    let field = |name| {
+        entry
+            .get(name)
+            .map(|chunks| chunks.format_verbatim().trim().to_owned())
+    };
+    let isbn = first_non_blank([field("isbn"), field("issn")]);
 
     Ok(Record {
         title,
