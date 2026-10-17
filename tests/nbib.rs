@@ -488,6 +488,22 @@ TI  - A test title
 fn empty_input() {
     assert_eq!(parse(""), Err(Error::EmptyInput));
     assert_eq!(parse("   \n\n  "), Err(Error::EmptyInput));
+    assert_eq!(parse("\u{feff}"), Err(Error::EmptyInput));
+    assert_eq!(parse("\u{feff} \n\t"), Err(Error::EmptyInput));
+}
+
+/// A leading byte-order mark does not hide the first record's first tag.
+#[test]
+fn leading_byte_order_mark_ignored() {
+    let input = "PMID- 1\nTI  - First\n";
+    let parsed = parse(&format!("\u{feff}{input}")).unwrap();
+    assert_eq!(parsed, parse(input).unwrap());
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(
+        parsed.records[0].extras.get("PMID").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 }
 
 /// A record without a title is kept, and the missing title is reported at the record's line.
@@ -839,4 +855,23 @@ fn structure_invariants(#[strategy(vec(arb_nbib_line(), 1..40))] lines: Vec<Stri
         .filter(|d| matches!(d, Diagnostic::MissingTitle { .. }))
         .count();
     prop_assert_eq!(missing, untitled);
+}
+
+// -- Byte-order mark --
+
+/// Any input, as serialised records or as arbitrary text. It never starts with a byte-order mark:
+/// U+FEFF is a format character, which `\PC` excludes, and the serialiser never writes it.
+fn arb_input_without_byte_order_mark() -> impl Strategy<Value = String> {
+    prop_oneof![
+        proptest::collection::vec(arb_nbib_record(), 0..4).prop_map(|records| serialize(&records)),
+        "\\PC{0,200}",
+    ]
+}
+
+/// A leading byte-order mark changes nothing: records, diagnostics and errors are the same.
+#[proptest]
+fn byte_order_mark_does_not_change_result(
+    #[strategy(arb_input_without_byte_order_mark())] input: String,
+) {
+    prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
 }

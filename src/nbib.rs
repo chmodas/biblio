@@ -14,7 +14,7 @@ use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
     append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
-    report_missing_title,
+    report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -26,9 +26,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// - [`Diagnostic::IgnoredLine`]: a line that is not a tag line, a continuation line or blank, or a
 ///   continuation line with no tag before it in its record.
 ///
+/// A leading byte-order mark is ignored.
+///
 /// # Errors
 ///
-/// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
+/// Returns [`Error::EmptyInput`] if the input, after any leading byte-order mark, is empty or
+/// whitespace-only.
 ///
 /// # Title and journal
 ///
@@ -37,6 +40,7 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// book belongs to. The collection title is never used as a title, because unrelated books in the
 /// same series share it. A blank tag never hides its fallback when the fallback has a value.
 pub fn parse(input: &str) -> Result<Parsed, Error> {
+    let input = strip_byte_order_mark(input);
     check_empty(input)?;
     let input = normalize_line_endings(input);
 

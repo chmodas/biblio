@@ -13,7 +13,7 @@ use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
     append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
-    report_missing_title,
+    report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -26,9 +26,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///   the end of the input.
 /// - [`Diagnostic::IgnoredLine`]: a line outside any record, or a non-tag line directly after `TY`.
 ///
+/// A leading byte-order mark is ignored.
+///
 /// # Errors
 ///
-/// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
+/// Returns [`Error::EmptyInput`] if the input, after any leading byte-order mark, is empty or
+/// whitespace-only.
 ///
 /// # Journal
 ///
@@ -38,6 +41,7 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// empty string. `T2` is read for every record type, so for chapters, conference papers and books
 /// the journal may hold the book, proceedings or series title.
 pub fn parse(input: &str) -> Result<Parsed, Error> {
+    let input = strip_byte_order_mark(input);
     check_empty(input)?;
     let input = normalize_line_endings(input);
 

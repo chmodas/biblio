@@ -536,6 +536,20 @@ fn extras_citation_key() {
 fn empty_input() {
     assert_eq!(parse(""), Err(Error::EmptyInput));
     assert_eq!(parse("   \n\n  "), Err(Error::EmptyInput));
+    assert_eq!(parse("\u{feff}"), Err(Error::EmptyInput));
+    assert_eq!(parse("\u{feff} \n\t"), Err(Error::EmptyInput));
+}
+
+/// A leading byte-order mark is ignored. This already worked before the mark was stripped
+/// explicitly; the test guards it.
+#[test]
+fn leading_byte_order_mark_ignored() {
+    let input = "@article{a, title = {First}}\n";
+    let parsed = parse(&format!("\u{feff}{input}")).unwrap();
+    assert_eq!(parsed, parse(input).unwrap());
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.records[0].title.as_deref(), Some("First"));
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 }
 
 /// A broken entry is skipped and reported at its line instead of failing the whole input.
@@ -941,4 +955,24 @@ fn missing_titles_reported_in_order(
         .collect();
     let missing: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
     prop_assert_eq!(missing, untitled);
+}
+
+// -- Byte-order mark --
+
+/// Any input, as serialised records or as arbitrary text. It never starts with a byte-order mark:
+/// U+FEFF is a format character, which `\PC` excludes, and the serialiser never writes it.
+fn arb_input_without_byte_order_mark() -> impl Strategy<Value = String> {
+    prop_oneof![
+        proptest::collection::vec(arb_bibtex_record(), 0..4)
+            .prop_map(|records| serialize(&records)),
+        "\\PC{0,200}",
+    ]
+}
+
+/// A leading byte-order mark changes nothing: records, diagnostics and errors are the same.
+#[proptest]
+fn byte_order_mark_does_not_change_result(
+    #[strategy(arb_input_without_byte_order_mark())] input: String,
+) {
+    prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
 }
