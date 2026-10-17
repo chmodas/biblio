@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use quick_xml::events::{BytesCData, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 
-use crate::parse_util::{check_empty, parsed, report_missing_title};
+use crate::parse_util::{check_empty, parsed, report_missing_title, strip_byte_order_mark};
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
 /// Parse `EndNote XML` text into zero or more [`Record`]s.
@@ -28,12 +28,18 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Unknown entities such as `&foo;` are dropped without a diagnostic, and a `<record>` nested
 /// inside another replaces the outer one without a diagnostic.
 ///
+/// A leading byte-order mark is ignored.
+///
 /// # Errors
 ///
-/// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
+/// Returns [`Error::EmptyInput`] if the input, after any leading byte-order mark, is empty or
+/// whitespace-only.
 /// Returns [`Error::MalformedSyntax`] if the XML breaks off, as for [`Diagnostic::Truncated`],
 /// before any record is complete.
 pub fn parse(input: &str) -> Result<Parsed, Error> {
+    // quick-xml would also skip the byte-order mark, but stripping it here first makes a mark
+    // followed only by whitespace count as empty input, as in the other formats.
+    let input = strip_byte_order_mark(input);
     check_empty(input)?;
 
     let (cleaned, removed_newlines) = strip_style_tags(input);

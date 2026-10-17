@@ -10,6 +10,13 @@ pub(crate) fn check_empty(input: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Remove a leading UTF-8 byte-order mark (U+FEFF). Exports from some databases begin with one.
+/// Only a single mark at the very start is removed; one after leading whitespace, or later in the
+/// input, is content.
+pub(crate) fn strip_byte_order_mark(input: &str) -> &str {
+    input.strip_prefix('\u{feff}').unwrap_or(input)
+}
+
 /// Normalise `\r\n` → `\n`. Returns a borrowed view when no `\r` is present
 /// (the common case), avoiding allocation.
 pub(crate) fn normalize_line_endings(input: &str) -> Cow<'_, str> {

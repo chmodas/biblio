@@ -19,7 +19,9 @@ use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{one_of, take_while};
 
-use crate::parse_util::{check_empty, first_non_blank, parsed, report_missing_title};
+use crate::parse_util::{
+    check_empty, first_non_blank, parsed, report_missing_title, strip_byte_order_mark,
+};
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
 /// Parse `BibTeX`/`BibLaTeX` text into zero or more [`Record`]s.
@@ -42,9 +44,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// parentheses, `@type(...)`, are not supported and are skipped. A stray `@word` in text between
 /// entries makes the entry before it fail.
 ///
+/// A leading byte-order mark is ignored.
+///
 /// # Errors
 ///
-/// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
+/// Returns [`Error::EmptyInput`] if the input, after any leading byte-order mark, is empty or
+/// whitespace-only.
 ///
 /// # Identifiers
 ///
@@ -53,6 +58,7 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// identifiers stays one string; the underlying parser still collapses whitespace and turns `--`
 /// into a dash.
 pub fn parse(input: &str) -> Result<Parsed, Error> {
+    let input = strip_byte_order_mark(input);
     check_empty(input)?;
 
     let mut records = Vec::new();
@@ -132,8 +138,8 @@ fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<D
 /// An entry starts at a line whose first non-blank text is `@`, a type name, and `{` or `(`.
 /// Splitting at line starts rather than by brace depth stops an unclosed brace from swallowing the
 /// entries after it. Text before the first such line becomes a chunk of its own if it contains an
-/// `@`, so an entry hidden there (after other text on its line, after a byte-order mark, or with
-/// its brace on the next line) is still parsed or reported; text without an `@` is a comment.
+/// `@`, so an entry hidden there (after other text on its line, or with its brace on the next line)
+/// is still parsed or reported; text without an `@` is a comment.
 fn split_entries(input: &str) -> Vec<(usize, &str)> {
     let mut starts = Vec::new();
     let mut offset = 0;
