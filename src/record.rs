@@ -51,27 +51,36 @@ use std::collections::HashMap;
 ///
 /// # Construction
 ///
-/// The struct derives [`Default`], so the idiomatic way to build one is to start from the default
-/// and set only the fields you have:
+/// The struct is `#[non_exhaustive]`, so new fields can be added without breaking callers. Build
+/// one with [`Record::builder`], setting only the fields you have:
 ///
 /// ```
 /// use biblio::{PublicationDate, Record};
 ///
-/// let rec = Record {
-///     title: "My paper".into(),
-///     authors: vec!["Doe, Jane".into()],
-///     date: Some(PublicationDate {
+/// let rec = Record::builder()
+///     .title("My paper")
+///     .author("Doe, Jane")
+///     .date(PublicationDate {
 ///         year: 2024,
 ///         month: None,
 ///         day: None,
-///     }),
-///     ..Default::default()
-/// };
+///     })
+///     .build();
+/// assert_eq!(rec.title.as_deref(), Some("My paper"));
 /// ```
+///
+/// The fields stay public, so a record can also be changed after it is built.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Record {
-    /// Title of the publication. Present in all formats and always expected to be non-empty.
-    pub title: String,
+    /// Title of the publication, or `None` if the source has none.
+    ///
+    /// Parsers keep records without a title and report a [`Diagnostic::MissingTitle`] for a title
+    /// that is `None` or blank. `EndNote XML` reads an empty `<title/>` as `None`; the other
+    /// formats keep a blank title tag as `Some("")`.
+    ///
+    /// [`Diagnostic::MissingTitle`]: crate::Diagnostic::MissingTitle
+    pub title: Option<String>,
 
     /// Authors of the publication as display-ready strings (e.g. `"Doe, Jane"`, `"Bloggs, Joe"`).
     ///
@@ -109,4 +118,115 @@ pub struct Record {
     /// Format-specific metadata not captured by the common fields above (e.g. PMID, PMCID for
     /// `NBIB`; citation key for `BibTeX`).
     pub extras: HashMap<String, String>,
+}
+
+impl Record {
+    /// Start building a record with every field empty.
+    #[must_use]
+    pub fn builder() -> RecordBuilder {
+        RecordBuilder::default()
+    }
+}
+
+/// Builds a [`Record`] one field at a time. Created by [`Record::builder`].
+///
+/// Each method sets one field and returns the builder; [`RecordBuilder::build`] returns the record.
+#[derive(Debug, Clone, Default)]
+pub struct RecordBuilder {
+    /// The record being built.
+    record: Record,
+}
+
+impl RecordBuilder {
+    /// Set the title.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.record.title = Some(title.into());
+        self
+    }
+
+    /// Append one author, as a display-ready string such as `"Doe, Jane"`.
+    #[must_use]
+    pub fn author(mut self, author: impl Into<String>) -> Self {
+        self.record.authors.push(author.into());
+        self
+    }
+
+    /// Append several authors, in order.
+    #[must_use]
+    pub fn authors(mut self, authors: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.record
+            .authors
+            .extend(authors.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set the publication date.
+    #[must_use]
+    pub fn date(mut self, date: PublicationDate) -> Self {
+        self.record.date = Some(date);
+        self
+    }
+
+    /// Set the journal, periodical or other containing work.
+    #[must_use]
+    pub fn journal(mut self, journal: impl Into<String>) -> Self {
+        self.record.journal = Some(journal.into());
+        self
+    }
+
+    /// Set the DOI, without a URL prefix.
+    #[must_use]
+    pub fn doi(mut self, doi: impl Into<String>) -> Self {
+        self.record.doi = Some(doi.into());
+        self
+    }
+
+    /// Set the page range or article number.
+    #[must_use]
+    pub fn pages(mut self, pages: impl Into<String>) -> Self {
+        self.record.pages = Some(pages.into());
+        self
+    }
+
+    /// Set the volume.
+    #[must_use]
+    pub fn volume(mut self, volume: impl Into<String>) -> Self {
+        self.record.volume = Some(volume.into());
+        self
+    }
+
+    /// Set the issue or number within the volume.
+    #[must_use]
+    pub fn number(mut self, number: impl Into<String>) -> Self {
+        self.record.number = Some(number.into());
+        self
+    }
+
+    /// Set the abstract.
+    #[must_use]
+    pub fn abstract_text(mut self, abstract_text: impl Into<String>) -> Self {
+        self.record.abstract_text = Some(abstract_text.into());
+        self
+    }
+
+    /// Set the ISBN or ISSN.
+    #[must_use]
+    pub fn isbn(mut self, isbn: impl Into<String>) -> Self {
+        self.record.isbn = Some(isbn.into());
+        self
+    }
+
+    /// Insert one format-specific value into `extras`, replacing any value already under `key`.
+    #[must_use]
+    pub fn extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.record.extras.insert(key.into(), value.into());
+        self
+    }
+
+    /// Return the built record.
+    #[must_use]
+    pub fn build(self) -> Record {
+        self.record
+    }
 }

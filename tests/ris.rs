@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use test_strategy::{Arbitrary, proptest};
 
 use biblio::ris::{parse, serialize};
-use biblio::{Error, PublicationDate, Record};
+use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume};
 
@@ -34,11 +34,11 @@ ID  - ref001
 ER  -
 ";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 1);
 
     let r = &records[0];
-    assert_eq!(r.title, "A test title");
+    assert_eq!(r.title.as_deref(), Some("A test title"));
     assert_eq!(r.authors, vec!["Doe, Jane", "Smith, John"]);
     assert_eq!(
         r.date,
@@ -95,12 +95,12 @@ SN  - 1546-170X
 ER  -
 ";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 2);
 
     assert_eq!(
-        records[0].title,
-        "CRISPR-Cas9 gene editing for sickle cell disease"
+        records[0].title.as_deref(),
+        Some("CRISPR-Cas9 gene editing for sickle cell disease")
     );
     assert_eq!(
         records[0].authors,
@@ -119,8 +119,8 @@ ER  -
     assert_eq!(records[0].isbn.as_deref(), Some("1533-4406"));
 
     assert_eq!(
-        records[1].title,
-        "Large language models in clinical medicine"
+        records[1].title.as_deref(),
+        Some("Large language models in clinical medicine")
     );
     assert_eq!(
         records[1].authors,
@@ -140,8 +140,8 @@ ER  -
 #[test]
 fn windows_line_endings() {
     let input = "TY  - JOUR\r\nTI  - A test title\r\nAU  - Doe, Jane\r\nER  -\r\n";
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "A test title");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("A test title"));
     assert_eq!(records[0].authors, vec!["Doe, Jane"]);
 }
 
@@ -154,8 +154,8 @@ KW  - keyword one
 N1  - some note
 ER  -
 ";
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "A test title");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("A test title"));
     assert!(records[0].extras.is_empty());
 }
 
@@ -166,9 +166,9 @@ TY  - JOUR
 TI  - Unclosed record
 AU  - Doe, Jane
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].title, "Unclosed record");
+    assert_eq!(records[0].title.as_deref(), Some("Unclosed record"));
 }
 
 // -- Authors --
@@ -182,7 +182,7 @@ AU  - Doe, Jane
 A1  - Smith, John
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors, vec!["Doe, Jane", "Smith, John"]);
 }
 
@@ -194,7 +194,7 @@ TI  - A test title
 A1  - Doe, Jane
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors, vec!["Doe, Jane"]);
 }
 
@@ -208,7 +208,7 @@ TI  - A test title
 DO  - 10.1016/S0140-6736(24)00624-X
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].doi.as_deref(),
         Some("10.1016/S0140-6736(24)00624-X")
@@ -225,7 +225,7 @@ TI  - A test title
 PY  - 2024///
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -244,7 +244,7 @@ TI  - A test title
 PY  - 2024/09//
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -263,7 +263,7 @@ TI  - A test title
 PY  - 2024/09/01/
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -282,7 +282,7 @@ TI  - A test title
 Y1  - 2023/06//
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -304,7 +304,7 @@ AB  - This abstract mentions that
 is  - not actually a tag
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].abstract_text.as_deref(),
         Some("This abstract mentions that is  - not actually a tag")
@@ -321,7 +321,7 @@ continues on the next line and
 keeps going further.
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].abstract_text.as_deref(),
         Some("This is a long abstract that continues on the next line and keeps going further.")
@@ -336,7 +336,7 @@ TI  - A test title
 N2  - Abstract via N2 tag.
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].abstract_text.as_deref(),
         Some("Abstract via N2 tag.")
@@ -351,7 +351,7 @@ TI  - A test title
 JF  - Science
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].journal.as_deref(), Some("Science"));
 }
 
@@ -365,7 +365,7 @@ const JOURNAL_TAGS: [&str; 6] = ["JF", "T2", "JO", "JA", "J2", "J1"];
 /// journal.
 fn journal_of(tag_lines: &str) -> Option<String> {
     let input = format!("TY  - JOUR\nTI  - A test title\n{tag_lines}ER  -\n");
-    parse(&input).unwrap().remove(0).journal
+    parse(&input).unwrap().records.remove(0).journal
 }
 
 /// The common layout: the full name in `T2` and the abbreviation in `J2`. The full name wins.
@@ -481,8 +481,10 @@ fn repeated_journal_tag_replaces_its_value() {
 /// space.
 #[test]
 fn blank_title_continued_without_leading_space() {
-    let records = parse("TY  - JOUR\nTI  -\nA test title\nER  -\n").unwrap();
-    assert_eq!(records[0].title, "A test title");
+    let records = parse("TY  - JOUR\nTI  -\nA test title\nER  -\n")
+        .unwrap()
+        .records;
+    assert_eq!(records[0].title.as_deref(), Some("A test title"));
 }
 
 /// A blank field continued over two lines joins the lines with a single space.
@@ -506,7 +508,9 @@ fn blank_journal_continued_without_leading_space() {
 /// space.
 #[test]
 fn blank_author_continued_without_leading_space() {
-    let records = parse("TY  - JOUR\nTI  - A test title\nAU  -\nDoe, Jane\nER  -\n").unwrap();
+    let records = parse("TY  - JOUR\nTI  - A test title\nAU  -\nDoe, Jane\nER  -\n")
+        .unwrap()
+        .records;
     assert_eq!(records[0].authors, vec!["Doe, Jane"]);
 }
 
@@ -527,7 +531,7 @@ TI  - A test title
 EP  - 130
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].pages, None);
 }
 
@@ -540,7 +544,7 @@ SP  - 123
 EP  - 130
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].pages.as_deref(), Some("123-130"));
 }
 
@@ -552,7 +556,7 @@ TI  - A test title
 SP  - e12345
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].pages.as_deref(), Some("e12345"));
 }
 
@@ -566,8 +570,8 @@ TI  - Preferred title
 T1  - Fallback title
 ER  -
 ";
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "Preferred title");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("Preferred title"));
 }
 
 #[test]
@@ -577,8 +581,8 @@ TY  - JOUR
 T1  - Fallback title
 ER  -
 ";
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "Fallback title");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("Fallback title"));
 }
 
 // -- Extras --
@@ -591,7 +595,7 @@ TI  - A test title
 ID  - ref001
 ER  -
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].extras.get("ID").map(String::as_str),
         Some("ref001")
@@ -606,42 +610,98 @@ fn empty_input() {
     assert_eq!(parse("   \n\n  "), Err(Error::EmptyInput));
 }
 
+/// A record without a title is kept, and the missing title is reported at the record's line.
 #[test]
-fn missing_title() {
+fn missing_title_kept_and_reported() {
     let input = "\
 TY  - JOUR
 AU  - Doe, Jane
 ER  -
 ";
-    let err = parse(input).unwrap_err();
-    assert!(matches!(err, Error::MissingRequiredField { tag: "TI", .. }));
+    let parsed = parse(input).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.records[0].title, None);
+    assert_eq!(parsed.records[0].authors, vec!["Doe, Jane"]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 1 }]
+    );
+}
+
+// -- Lenient parsing --
+
+/// A `TY` before the open record's `ER` keeps both records and reports the unterminated one.
+#[test]
+fn ty_before_er_keeps_both_records() {
+    let parsed = parse("TY  - JOUR\nTI  - First\nTY  - JOUR\nTI  - Second\nER  -\n").unwrap();
+    let titles: Vec<_> = parsed.records.iter().map(|r| r.title.as_deref()).collect();
+    assert_eq!(titles, vec![Some("First"), Some("Second")]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::UnterminatedRecord { line: 1 }]
+    );
+}
+
+/// A record still open at the end of the input is kept and reported.
+#[test]
+fn unterminated_record_at_end_reported() {
+    let parsed = parse("TY  - JOUR\nTI  - Open\n").unwrap();
+    assert_eq!(parsed.records[0].title.as_deref(), Some("Open"));
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::UnterminatedRecord { line: 1 }]
+    );
+}
+
+/// Tags before the first `TY` and a stray `ER` are ignored and reported at their lines.
+#[test]
+fn lines_outside_records_ignored() {
+    let parsed = parse("TI  - Stray\nTY  - JOUR\nTI  - Kept\nER  -\n\nER  -\nnot a tag\n").unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![
+            Diagnostic::IgnoredLine { line: 1 },
+            Diagnostic::IgnoredLine { line: 6 },
+            Diagnostic::IgnoredLine { line: 7 },
+        ]
+    );
+}
+
+/// A non-tag line directly after `TY` has no field to continue, so it is ignored.
+#[test]
+fn line_after_ty_ignored() {
+    let parsed = parse("TY  - JOUR\nloose text\nTI  - Kept\nER  -\n").unwrap();
+    assert_eq!(parsed.records[0].title.as_deref(), Some("Kept"));
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::IgnoredLine { line: 2 }]
+    );
+}
+
+/// A continuation line after a tag that is not read is still part of the record, not ignored.
+#[test]
+fn continuation_of_unread_tag_not_reported() {
+    let parsed = parse("TY  - JOUR\nTI  - t\nN1  - a note\nthat wraps\nER  -\n").unwrap();
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 }
 
 // -- Serialization --
 
 #[test]
 fn serialize_multiple_records() {
-    let a = Record {
-        title: "First".into(),
-        ..Default::default()
-    };
-    let b = Record {
-        title: "Second".into(),
-        ..Default::default()
-    };
+    let a = Record::builder().title("First").build();
+    let b = Record::builder().title("Second").build();
     let output = serialize(&[a, b]);
-    let reparsed = parse(&output).unwrap();
+    let reparsed = parse(&output).unwrap().records;
     assert_eq!(reparsed.len(), 2);
-    assert_eq!(reparsed[0].title, "First");
-    assert_eq!(reparsed[1].title, "Second");
+    assert_eq!(reparsed[0].title.as_deref(), Some("First"));
+    assert_eq!(reparsed[1].title.as_deref(), Some("Second"));
 }
 
 #[test]
 fn serialize_skips_none_fields() {
-    let record = Record {
-        title: "Minimal".into(),
-        ..Default::default()
-    };
+    let record = Record::builder().title("Minimal").build();
     let output = serialize(&[record]);
     assert!(output.contains("TI  - Minimal"));
     assert!(!output.contains("AU  -"));
@@ -651,11 +711,7 @@ fn serialize_skips_none_fields() {
 
 #[test]
 fn serialize_pages_split() {
-    let record = Record {
-        title: "Test".into(),
-        pages: Some("123-456".into()),
-        ..Default::default()
-    };
+    let record = Record::builder().title("Test").pages("123-456").build();
     let output = serialize(&[record]);
     assert!(output.contains("SP  - 123"));
     assert!(output.contains("EP  - 456"));
@@ -663,11 +719,10 @@ fn serialize_pages_split() {
 
 #[test]
 fn serialize_en_dash_pages() {
-    let record = Record {
-        title: "Test".into(),
-        pages: Some("123\u{2013}456".into()),
-        ..Default::default()
-    };
+    let record = Record::builder()
+        .title("Test")
+        .pages("123\u{2013}456")
+        .build();
     let output = serialize(&[record]);
     assert!(output.contains("SP  - 123"));
     assert!(output.contains("EP  - 456"));
@@ -683,7 +738,7 @@ fn format_ris_date(date: PublicationDate) -> String {
 
 fn arb_ris_record() -> impl Strategy<Value = Record> {
     (
-        arb_text(80),
+        proptest::option::of(arb_text(80)),
         proptest::collection::vec(arb_author(), 0..5),
         proptest::option::of(arb_date()),
         proptest::option::of(arb_text(60)),
@@ -714,18 +769,20 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                 if let Some(id) = id {
                     extras.insert("ID".into(), id);
                 }
-                Record {
-                    title,
-                    authors,
-                    date,
-                    journal,
-                    doi,
-                    pages,
-                    volume,
-                    number,
-                    abstract_text,
-                    isbn,
-                    extras,
+                {
+                    let mut record = Record::default();
+                    record.title = title;
+                    record.authors = authors;
+                    record.date = date;
+                    record.journal = journal;
+                    record.doi = doi;
+                    record.pages = pages;
+                    record.volume = volume;
+                    record.number = number;
+                    record.abstract_text = abstract_text;
+                    record.isbn = isbn;
+                    record.extras = extras;
+                    record
                 }
             },
         )
@@ -743,7 +800,9 @@ fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
 #[proptest]
 fn date_round_trip(#[strategy(arb_date())] date: PublicationDate) {
     let formatted = format_ris_date(date);
-    let reparsed = parse(&format!("TY  - JOUR\nTI  - t\nPY  - {formatted}\nER  -\n")).unwrap()[0]
+    let reparsed = parse(&format!("TY  - JOUR\nTI  - t\nPY  - {formatted}\nER  -\n"))
+        .unwrap()
+        .records[0]
         .date
         .unwrap();
     prop_assert_eq!(date, reparsed);
@@ -753,7 +812,7 @@ fn date_round_trip(#[strategy(arb_date())] date: PublicationDate) {
 #[proptest]
 fn serialize_round_trip(#[strategy(arb_ris_record())] record: Record) {
     let serialized = serialize(std::slice::from_ref(&record));
-    let reparsed = parse(&serialized).unwrap();
+    let reparsed = parse(&serialized).unwrap().records;
     prop_assert_eq!(vec![record], reparsed);
 }
 
@@ -767,12 +826,9 @@ fn adversarial_values_round_trip(
     let title = format!("{padding} {tag_like} {padding}")
         .trim_end()
         .to_owned();
-    let record = Record {
-        title,
-        ..Default::default()
-    };
+    let record = Record::builder().title(title).build();
     let serialized = serialize(std::slice::from_ref(&record));
-    let reparsed = parse(&serialized).unwrap();
+    let reparsed = parse(&serialized).unwrap().records;
     prop_assert_eq!(vec![record], reparsed);
 }
 
@@ -861,13 +917,97 @@ fn blank_field_continued_is_continuation_text(
         "TI  - t\n"
     };
     let input = format!("TY  - JOUR\n{title}{tag}  -\n{text}\nER  -\n");
-    let record = parse(&input).unwrap().remove(0);
+    let record = parse(&input).unwrap().records.remove(0);
 
     let field = match tag {
-        "TI" | "T1" => Some(record.title),
+        "TI" | "T1" => record.title,
         "AB" | "N2" => record.abstract_text,
         "AU" | "A1" => record.authors.last().cloned(),
         _ => record.journal,
     };
     prop_assert_eq!(field.as_deref(), Some(text.trim()));
+}
+
+// -- Lenient parsing properties --
+
+/// A line that is not blank and not a tag line: any printable text not starting with whitespace,
+/// minus the rare values that happen to look like `XX  -`.
+fn arb_garbage_line() -> impl Strategy<Value = String> {
+    "[^\\s\\p{C}][^\\p{C}]{0,40}".prop_filter("must not be a tag line", |line| {
+        let bytes = line.as_bytes();
+        !(bytes.len() >= 5
+            && bytes[..2]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && &bytes[2..5] == b"  -")
+    })
+}
+
+/// Garbage lines between two valid files keep every record and are each reported at their line.
+#[proptest]
+fn garbage_between_files_keeps_records(
+    #[strategy(vec(arb_ris_record(), 0..=3))] before: Vec<Record>,
+    #[strategy(vec(arb_garbage_line(), 1..=4))] garbage: Vec<String>,
+    #[strategy(vec(arb_ris_record(), 0..=3))] after: Vec<Record>,
+) {
+    let head = serialize(&before);
+    let input = format!("{head}{}\n{}", garbage.join("\n"), serialize(&after));
+    let parsed = parse(&input).unwrap();
+
+    let expected: Vec<Record> = before.into_iter().chain(after).collect();
+    prop_assert_eq!(parsed.records, expected);
+
+    let first = head.lines().count() + 1;
+    let ignored: Vec<usize> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::IgnoredLine { .. }))
+        .map(Diagnostic::line)
+        .collect();
+    let expected_lines: Vec<usize> = (first..first + garbage.len()).collect();
+    prop_assert_eq!(ignored, expected_lines);
+}
+
+/// Lines drawn from the pieces of a `RIS` file, in any order, including blank and stray lines.
+fn arb_ris_line() -> impl Strategy<Value = String> {
+    prop_oneof![
+        2 => Just("TY  - JOUR".to_owned()),
+        2 => Just("ER  -".to_owned()),
+        2 => Just("TI  - A title".to_owned()),
+        1 => Just("TI  -".to_owned()),
+        1 => Just("T1  - Another title".to_owned()),
+        2 => Just("AU  - Doe, Jane".to_owned()),
+        1 => Just(String::new()),
+        2 => arb_garbage_line(),
+    ]
+}
+
+/// However the pieces are arranged, every `TY` gives exactly one record, diagnostics come in line
+/// order, and each record without a usable title is reported once.
+#[proptest]
+fn structure_invariants(#[strategy(vec(arb_ris_line(), 1..40))] lines: Vec<String>) {
+    let input = lines.join("\n");
+    let Ok(parsed) = parse(&input) else {
+        // Only blank input is rejected.
+        prop_assert!(input.trim().is_empty());
+        return Ok(());
+    };
+
+    let ty_lines = lines.iter().filter(|l| l.as_str() == "TY  - JOUR").count();
+    prop_assert_eq!(parsed.records.len(), ty_lines);
+
+    let diagnostic_lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    prop_assert!(diagnostic_lines.is_sorted());
+
+    let untitled = parsed
+        .records
+        .iter()
+        .filter(|r| r.title.as_deref().is_none_or(|t| t.trim().is_empty()))
+        .count();
+    let missing = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::MissingTitle { .. }))
+        .count();
+    prop_assert_eq!(missing, untitled);
 }

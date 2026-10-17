@@ -1,0 +1,96 @@
+use std::fmt;
+
+use crate::Record;
+
+/// The outcome of parsing one input: every record that could be read, and what went wrong.
+///
+/// Parsers keep every record they can. Anything they had to drop or patch is reported in
+/// `diagnostics`, sorted by line.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct Parsed {
+    /// The records, in the order they appear in the input.
+    pub records: Vec<Record>,
+
+    /// Problems found while parsing, sorted by line (stable, so problems on the same line keep the
+    /// order in which they were found).
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A problem with one record or line of the input.
+///
+/// The record concerned is kept unless the variant says otherwise. Every variant carries a
+/// one-indexed `line`: the line where the record or entry starts, or for [`Self::IgnoredLine`] and
+/// [`Self::Truncated`], the line concerned. New variants may be added, so a `match` needs a
+/// wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Diagnostic {
+    /// The record has no title, or only a blank one. The record is kept.
+    MissingTitle {
+        /// Line where the record starts.
+        line: usize,
+    },
+
+    /// A `RIS` record was not closed with `ER` before the next `TY` or the end of the input. The
+    /// record is kept.
+    UnterminatedRecord {
+        /// Line where the record starts.
+        line: usize,
+    },
+
+    /// A line could not be attached to any record and was ignored.
+    IgnoredLine {
+        /// The ignored line.
+        line: usize,
+    },
+
+    /// A `BibTeX` entry or `@string` definition could not be parsed and was dropped.
+    SkippedEntry {
+        /// Line where the entry starts.
+        line: usize,
+        /// What the underlying parser reported.
+        message: String,
+    },
+
+    /// The input broke off: an `EndNote XML` syntax error, or the end of the input inside a record.
+    /// The records before it are kept, the record in progress is dropped, and parsing stops.
+    Truncated {
+        /// Line of the syntax error, or where the unfinished record starts.
+        line: usize,
+        /// What went wrong.
+        message: String,
+    },
+}
+
+impl Diagnostic {
+    /// The one-indexed line the diagnostic refers to.
+    #[must_use]
+    pub fn line(&self) -> usize {
+        match self {
+            Self::MissingTitle { line }
+            | Self::UnterminatedRecord { line }
+            | Self::IgnoredLine { line }
+            | Self::SkippedEntry { line, .. }
+            | Self::Truncated { line, .. } => *line,
+        }
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTitle { line } => write!(f, "record at line {line} has no title"),
+            Self::UnterminatedRecord { line } => {
+                write!(f, "record at line {line} was not closed with ER")
+            }
+            Self::IgnoredLine { line } => write!(f, "ignored line {line}"),
+            Self::SkippedEntry { line, message } => {
+                write!(f, "skipped entry at line {line}: {message}")
+            }
+            Self::Truncated { line, message } => {
+                write!(f, "input truncated at line {line}: {message}")
+            }
+        }
+    }
+}

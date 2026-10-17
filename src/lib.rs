@@ -16,7 +16,7 @@
 //! }
 //! "#;
 //!
-//! let records = bibtex::parse(bibtex_input).unwrap();
+//! let records = bibtex::parse(bibtex_input).unwrap().records;
 //! let ris_output = ris::serialize(&records);
 //! assert!(ris_output.contains("TI  - An interesting finding"));
 //! ```
@@ -25,8 +25,10 @@ pub mod endnote_xml;
 mod error;
 pub mod nbib;
 mod parse_util;
+mod parsed;
 mod record;
 pub mod ris;
 
 pub use error::Error;
-pub use record::{PublicationDate, Record};
+pub use parsed::{Diagnostic, Parsed};
+pub use record::{PublicationDate, Record, RecordBuilder};

@@ -12,16 +12,23 @@ use winnow::Parser;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
+    report_missing_title,
 };
-use crate::{Error, PublicationDate, Record};
+use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
 /// Parse `RIS`-formatted text into zero or more [`Record`]s.
+///
+/// Every record is kept, even one without a title. Problems are reported as diagnostics:
+///
+/// - [`Diagnostic::MissingTitle`]: a record has no `TI` or `T1`, or only a blank one.
+/// - [`Diagnostic::UnterminatedRecord`]: a record is not closed with `ER` before the next `TY` or
+///   the end of the input.
+/// - [`Diagnostic::IgnoredLine`]: a line outside any record, or a non-tag line directly after `TY`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
-/// Returns [`Error::MissingRequiredField`] if a record lacks a title (`TI` or `T1`).
 ///
 /// # Journal
 ///
@@ -30,12 +37,13 @@ use crate::{Error, PublicationDate, Record};
 /// never hides a less preferred tag with a value; if every journal tag is blank, the journal is an
 /// empty string. `T2` is read for every record type, so for chapters, conference papers and books
 /// the journal may hold the book, proceedings or series title.
-pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
+pub fn parse(input: &str) -> Result<Parsed, Error> {
     check_empty(input)?;
     let input = normalize_line_endings(input);
 
     let mut records = Vec::new();
-    let mut builder: Option<RecordBuilder> = None;
+    let mut diagnostics = Vec::new();
+    let mut pending: Option<PendingRecord> = None;
 
     // Each RIS line is one of three kinds:
     //   1. Tag line:  "XX  - value"  (exactly 2 uppercase chars, two spaces, dash, space)
@@ -51,38 +59,48 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
 
         if let Ok((tag, value)) = tag_line.parse(line) {
             match tag {
-                // TY starts a new record.
+                // TY starts a new record, closing any record still open.
                 "TY" => {
-                    builder = Some(RecordBuilder {
+                    if let Some(open) = pending.take() {
+                        diagnostics.push(Diagnostic::UnterminatedRecord {
+                            line: open.line_start,
+                        });
+                        records.push(open.finish(&mut diagnostics));
+                    }
+                    pending = Some(PendingRecord {
                         line_start: line_number,
-                        ..RecordBuilder::default()
+                        ..PendingRecord::default()
                     });
                 }
                 // ER finalizes the current record.
-                "ER" => {
-                    if let Some(b) = builder.take() {
-                        records.push(b.finish()?);
-                    }
-                }
-                // Any other tag – dispatch to the current builder.
-                _ => {
-                    if let Some(b) = builder.as_mut() {
-                        b.dispatch(tag, value);
-                    }
-                }
+                "ER" => match pending.take() {
+                    Some(open) => records.push(open.finish(&mut diagnostics)),
+                    None => diagnostics.push(Diagnostic::IgnoredLine { line: line_number }),
+                },
+                // Any other tag – dispatch to the current record.
+                _ => match pending.as_mut() {
+                    Some(open) => open.dispatch(tag, value),
+                    None => diagnostics.push(Diagnostic::IgnoredLine { line: line_number }),
+                },
             }
-        } else if let Some(b) = builder.as_mut() {
-            // Continuation line – append to the previous field.
-            b.append_continuation(line.trim());
+        } else if !pending
+            .as_mut()
+            .is_some_and(|open| open.append_continuation(line.trim()))
+        {
+            // Neither a tag nor a continuation of one.
+            diagnostics.push(Diagnostic::IgnoredLine { line: line_number });
         }
     }
 
-    // Handle a record that was never closed with ER.
-    if let Some(b) = builder.take() {
-        records.push(b.finish()?);
+    // Keep a record that was never closed with ER.
+    if let Some(open) = pending.take() {
+        diagnostics.push(Diagnostic::UnterminatedRecord {
+            line: open.line_start,
+        });
+        records.push(open.finish(&mut diagnostics));
     }
 
-    Ok(records)
+    Ok(parsed(records, diagnostics))
 }
 
 /// Serialize [`Record`]s to `RIS` format.
@@ -100,7 +118,9 @@ pub fn serialize(records: &[Record]) -> String {
         }
 
         write_tag(&mut buf, "TY", "JOUR");
-        write_tag(&mut buf, "TI", &record.title);
+        if let Some(title) = &record.title {
+            write_tag(&mut buf, "TI", title);
+        }
 
         for author in &record.authors {
             write_tag(&mut buf, "AU", author);
@@ -223,15 +243,17 @@ fn journal_index(tag: &str) -> Option<usize> {
     JOURNAL_TAGS.iter().position(|t| *t == tag)
 }
 
+/// A record being read, before its fields are combined into a [`Record`].
 #[derive(Default)]
-struct RecordBuilder {
+struct PendingRecord {
+    /// Line of the record's `TY` tag.
     line_start: usize,
     ti_title: Option<String>,
     t1_title: Option<String>,
     authors: Vec<String>,
     date: Option<PublicationDate>,
     /// The value of each journal tag, indexed like [`JOURNAL_TAGS`]. The journal is chosen from
-    /// these in [`RecordBuilder::finish`].
+    /// these in [`PendingRecord::finish`].
     journals: [Option<String>; JOURNAL_TAGS.len()],
     doi: Option<String>,
     start_page: Option<String>,
@@ -244,7 +266,7 @@ struct RecordBuilder {
     last_tag: Option<String>,
 }
 
-impl RecordBuilder {
+impl PendingRecord {
     fn dispatch(&mut self, tag: &str, value: &str) {
         if let Some(i) = journal_index(tag) {
             self.journals[i] = Some(value.to_owned());
@@ -270,13 +292,15 @@ impl RecordBuilder {
         self.last_tag = Some(tag.to_owned());
     }
 
-    fn append_continuation(&mut self, text: &str) {
+    /// Append a continuation line to the field of the previous tag. Returns `false` if there is no
+    /// previous tag to continue; a tag whose field is not read still takes its continuation lines.
+    fn append_continuation(&mut self, text: &str) -> bool {
         let Some(tag) = self.last_tag.as_deref() else {
-            return;
+            return false;
         };
         if let Some(i) = journal_index(tag) {
             append_to_opt(&mut self.journals[i], text);
-            return;
+            return true;
         }
         match tag {
             "TI" => append_to_opt(&mut self.ti_title, text),
@@ -285,17 +309,14 @@ impl RecordBuilder {
             "AU" | "A1" => append_to_last(&mut self.authors, text),
             _ => {}
         }
+        true
     }
 
-    fn finish(self) -> Result<Record, Error> {
+    /// Combine the fields into a [`Record`], reporting a missing title.
+    fn finish(self, diagnostics: &mut Vec<Diagnostic>) -> Record {
         // Prefer TI over T1.
-        let title = self
-            .ti_title
-            .or(self.t1_title)
-            .ok_or(Error::MissingRequiredField {
-                tag: "TI",
-                line: self.line_start,
-            })?;
+        let title = self.ti_title.or(self.t1_title);
+        report_missing_title(title.as_deref(), self.line_start, diagnostics);
 
         // Combine SP + EP into a single pages string.
         let pages = match (self.start_page, self.end_page) {
@@ -306,7 +327,7 @@ impl RecordBuilder {
 
         let journal = first_non_blank(self.journals);
 
-        Ok(Record {
+        Record {
             title,
             authors: self.authors,
             date: self.date,
@@ -318,6 +339,6 @@ impl RecordBuilder {
             abstract_text: self.abstract_text,
             isbn: self.isbn,
             extras: self.extras,
-        })
+        }
     }
 }

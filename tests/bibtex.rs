@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use test_strategy::{Arbitrary, proptest};
 
 use biblio::bibtex::{parse, serialize};
-use biblio::{Error, PublicationDate, Record};
+use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::arb_date;
 
@@ -31,11 +31,11 @@ fn single_entry() {
 }
 ";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 1);
 
     let r = &records[0];
-    assert_eq!(r.title, "A test title");
+    assert_eq!(r.title.as_deref(), Some("A test title"));
     assert_eq!(r.authors, vec!["Doe, Jane", "Smith, John"]);
     assert_eq!(
         r.date,
@@ -79,16 +79,19 @@ fn multiple_entries() {
 }
 ";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].title, "CRISPR-Cas9 gene editing");
+    assert_eq!(
+        records[0].title.as_deref(),
+        Some("CRISPR-Cas9 gene editing")
+    );
     assert_eq!(
         records[0].extras.get("key").map(String::as_str),
         Some("frangoul2024")
     );
     assert_eq!(
-        records[1].title,
-        "Large language models in clinical medicine"
+        records[1].title.as_deref(),
+        Some("Large language models in clinical medicine")
     );
 }
 
@@ -100,8 +103,8 @@ fn misc_entry_type() {
   year = {2024},
 }
 ";
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "A website resource");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("A website resource"));
     assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
@@ -115,7 +118,7 @@ fn no_authors() {
   year = {2024},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
@@ -127,7 +130,7 @@ fn author_with_prefix() {
   author = {von Neumann, John},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors, vec!["von Neumann, John"]);
 }
 
@@ -139,7 +142,7 @@ fn author_name_only() {
   author = {{CERN}},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors.len(), 1);
     assert!(!records[0].authors[0].contains(','));
 }
@@ -152,7 +155,7 @@ fn author_with_suffix() {
   author = {King, Jr., Martin Luther},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors.len(), 1);
     assert!(records[0].authors[0].contains("Jr."));
 }
@@ -167,7 +170,7 @@ fn date_year_only() {
   year = {2024},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -186,7 +189,7 @@ fn date_full_iso() {
   date = {2024-09-01},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -205,7 +208,7 @@ fn date_between() {
   date = {2020/2024},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].date.unwrap().year, 2020);
 }
 
@@ -217,7 +220,7 @@ fn date_after() {
   date = {2020/..},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].date.unwrap().year, 2020);
 }
 
@@ -229,7 +232,7 @@ fn date_before() {
   date = {../2024},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].date.unwrap().year, 2024);
 }
 
@@ -241,7 +244,7 @@ fn date_unparseable_chunks() {
   date = {2020 approximate},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -262,7 +265,7 @@ fn pages_typed_range() {
   pages = {123--130},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].pages.as_deref(), Some("123-130"));
 }
 
@@ -274,7 +277,7 @@ fn pages_chunks_verbatim() {
   pages = {S12--S18},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     // Non-numeric pages fall back to chunks verbatim.
     assert!(records[0].pages.is_some());
 }
@@ -289,7 +292,7 @@ fn volume_non_numeric() {
   volume = {S1},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].volume.as_deref(), Some("S1"));
 }
 
@@ -303,7 +306,7 @@ fn journaltitle_preferred() {
   journaltitle = {Nature Medicine},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].journal.as_deref(), Some("Nature Medicine"));
 }
 
@@ -315,7 +318,7 @@ fn journal_fallback() {
   journal = {Science},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].journal.as_deref(), Some("Science"));
 }
 
@@ -325,7 +328,7 @@ fn journal_fallback() {
 /// identifier.
 fn identifier_of(field_lines: &str) -> Option<String> {
     let input = format!("@article{{k,\n  title = {{t}},\n{field_lines}}}\n");
-    parse(&input).unwrap().remove(0).isbn
+    parse(&input).unwrap().records.remove(0).isbn
 }
 
 /// An entry with only an ISSN gets it as its identifier.
@@ -371,6 +374,146 @@ fn several_issns_kept_verbatim() {
     assert_eq!(identifier.as_deref(), Some("1234-5678, 2345-6789"));
 }
 
+// -- Lenient parsing --
+
+/// Titles of the parsed records, in order.
+fn titles(parsed: &biblio::Parsed) -> Vec<Option<&str>> {
+    parsed.records.iter().map(|r| r.title.as_deref()).collect()
+}
+
+/// A broken entry between two valid ones is skipped and reported at its line; the others are kept.
+#[test]
+fn broken_entry_between_valid_ones_skipped() {
+    let input = "@article{a, title = {A}}\n@article{b title = {B}}\n@article{c, title = {C}}\n";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("C")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 2, .. }]
+    ));
+}
+
+/// The message of a skipped entry describes the problem without byte offsets into the input.
+#[test]
+fn skipped_entry_message_has_no_offsets() {
+    let parsed = parse("@article{b title = {B}}\n").unwrap();
+    let [Diagnostic::SkippedEntry { message, .. }] = parsed.diagnostics.as_slice() else {
+        panic!("expected one skipped entry, got {:?}", parsed.diagnostics);
+    };
+    assert_ne!(message.as_str(), "");
+    assert!(
+        !message.ends_with(|c: char| c.is_ascii_digit()),
+        "{message}"
+    );
+}
+
+/// An unclosed brace does not swallow the entries after it.
+#[test]
+fn unclosed_brace_does_not_swallow_next_entry() {
+    let input = "@article{a, title = {never closed\n@article{b, title = {B}}\n";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, .. }]
+    ));
+}
+
+/// `@string` macros still expand when entries are parsed one by one.
+#[test]
+fn string_macros_expand_after_a_broken_entry() {
+    let input = "\
+@string{jn = {Nature}}
+@article{a, title = {A}, journal = jn}
+@article{b, title = {B}
+";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    assert_eq!(parsed.records[0].journal.as_deref(), Some("Nature"));
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 3, .. }]
+    ));
+}
+
+/// Entries with the same citation key are all kept, without a diagnostic.
+#[test]
+fn duplicate_keys_keep_every_entry() {
+    let parsed = parse("@article{a, title = {One}}\n@article{a, title = {Two}}\n").unwrap();
+    assert_eq!(titles(&parsed), vec![Some("One"), Some("Two")]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// A broken `@string` is reported, and the macros that could be read still expand.
+#[test]
+fn broken_string_skipped_others_expand() {
+    let input = "\
+@string{good = {Nature}}
+@string{bad = {never closed}
+@article{a, title = {A}, journal = good}
+";
+    let parsed = parse(input).unwrap();
+    assert_eq!(parsed.records[0].journal.as_deref(), Some("Nature"));
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 2, .. }]
+    ));
+}
+
+/// An entry that uses an undefined macro is skipped; the other entries are kept.
+#[test]
+fn undefined_macro_skips_only_its_entry() {
+    let input = "@article{a, title = {A}, journal = nope}\n@article{b, title = {B}}\n";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, .. }]
+    ));
+}
+
+/// An entry after other text on the first line is still read when the per-entry path is taken
+/// (here forced by a duplicate key). Regression test from code review.
+#[test]
+fn entry_after_leading_text_kept() {
+    let parsed = parse("See @article{a, title = {A}}\n@article{a, title = {B}}\n").unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("B")]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// An entry after a byte-order mark is still read when the per-entry path is taken. Regression
+/// test from code review.
+#[test]
+fn entry_after_byte_order_mark_kept() {
+    let parsed = parse("\u{feff}@article{a, title = {A}}\n@article{a, title = {B}}\n").unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("B")]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// An entry whose brace is on the line after its type is still read when the per-entry path is
+/// taken. Regression test from code review.
+#[test]
+fn entry_with_brace_on_next_line_kept() {
+    let input = "@article\n{a, title = {A}}\n@article{b, title = {B}\n@article{c, title = {C}}\n";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("C")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 3, .. }]
+    ));
+}
+
+/// Entries written with parentheses are not supported and are skipped.
+#[test]
+fn parenthesised_entry_skipped() {
+    let parsed = parse("@article(a, title = {A})\n@article{b, title = {B}}\n").unwrap();
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, .. }]
+    ));
+}
+
 // -- Extras --
 
 #[test]
@@ -380,7 +523,7 @@ fn extras_citation_key() {
   title = {Test},
 }
 ";
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].extras.get("key").map(String::as_str),
         Some("mykey2024")
@@ -395,59 +538,58 @@ fn empty_input() {
     assert_eq!(parse("   \n\n  "), Err(Error::EmptyInput));
 }
 
+/// A broken entry is skipped and reported at its line instead of failing the whole input.
 #[test]
-fn malformed_bibtex() {
-    let result = parse("@article{broken, title = {missing close brace}");
-    assert!(result.is_err());
+fn malformed_entry_skipped() {
+    let parsed = parse("@article{broken, title = {missing close brace}").unwrap();
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, .. }]
+    ));
 }
 
+/// An entry without a title is kept, and the missing title is reported at the entry's line.
 #[test]
-fn missing_title() {
+fn missing_title_kept_and_reported() {
     let input = r"
 @article{x,
   year = {2024},
 }
 ";
-    let result = parse(input);
-    assert!(matches!(
-        result,
-        Err(Error::MissingRequiredField { tag: "title", .. })
-    ));
+    let parsed = parse(input).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.records[0].title, None);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 2 }]
+    );
 }
 
 // -- Serialization --
 
 #[test]
 fn serialize_multiple_entries() {
-    let a = Record {
-        title: "First".into(),
-        extras: [("key".into(), "a".into())].into_iter().collect(),
-        ..Default::default()
-    };
-    let b = Record {
-        title: "Second".into(),
-        extras: [("key".into(), "b".into())].into_iter().collect(),
-        ..Default::default()
-    };
+    let a = Record::builder().title("First").extra("key", "a").build();
+    let b = Record::builder().title("Second").extra("key", "b").build();
     let output = serialize(&[a, b]);
-    let reparsed = parse(&output).unwrap();
+    let reparsed = parse(&output).unwrap().records;
     assert_eq!(reparsed.len(), 2);
-    assert_eq!(reparsed[0].title, "First");
-    assert_eq!(reparsed[1].title, "Second");
+    assert_eq!(reparsed[0].title.as_deref(), Some("First"));
+    assert_eq!(reparsed[1].title.as_deref(), Some("Second"));
 }
 
 #[test]
 fn serialize_with_month() {
-    let record = Record {
-        title: "Test".into(),
-        date: Some(PublicationDate {
+    let record = Record::builder()
+        .title("Test")
+        .date(PublicationDate {
             year: 2024,
             month: Some(3),
             day: None,
-        }),
-        extras: [("key".into(), "test".into())].into_iter().collect(),
-        ..Default::default()
-    };
+        })
+        .extra("key", "test")
+        .build();
     let output = serialize(&[record]);
     assert!(output.contains("year = {2024}"));
     assert!(output.contains("month = {3}"));
@@ -455,11 +597,10 @@ fn serialize_with_month() {
 
 #[test]
 fn serialize_skips_none_fields() {
-    let record = Record {
-        title: "Minimal".into(),
-        extras: [("key".into(), "min".into())].into_iter().collect(),
-        ..Default::default()
-    };
+    let record = Record::builder()
+        .title("Minimal")
+        .extra("key", "min")
+        .build();
     let output = serialize(&[record]);
     assert!(output.contains("title = {Minimal}"));
     assert!(!output.contains("author"));
@@ -474,14 +615,6 @@ fn error_display() {
     assert_eq!(
         Error::EmptyInput.to_string(),
         "input was empty or only contained whitespace"
-    );
-    assert_eq!(
-        Error::MissingRequiredField {
-            tag: "title",
-            line: 1
-        }
-        .to_string(),
-        "missing required field 'title' at line 1"
     );
     assert_eq!(
         Error::MalformedSyntax {
@@ -554,7 +687,7 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
     };
 
     (
-        arb_bib_text(80),
+        proptest::option::of(arb_bib_text(80)),
         // BibTeX-specific author: no hyphens (biblatex converts -- to en-dash),
         // no commas (BibTeX name-part separator). Use "Last, First" format.
         proptest::collection::vec(
@@ -617,18 +750,20 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
             )| {
                 let mut extras = HashMap::new();
                 extras.insert("key".into(), key);
-                Record {
-                    title,
-                    authors,
-                    date,
-                    journal,
-                    doi,
-                    pages,
-                    volume,
-                    number,
-                    abstract_text,
-                    isbn,
-                    extras,
+                {
+                    let mut record = Record::default();
+                    record.title = title;
+                    record.authors = authors;
+                    record.date = date;
+                    record.journal = journal;
+                    record.doi = doi;
+                    record.pages = pages;
+                    record.volume = volume;
+                    record.number = number;
+                    record.abstract_text = abstract_text;
+                    record.isbn = isbn;
+                    record.extras = extras;
+                    record
                 }
             },
         )
@@ -646,7 +781,7 @@ fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
 #[proptest]
 fn serialize_round_trip(#[strategy(arb_bibtex_record())] record: Record) {
     let serialized = serialize(std::slice::from_ref(&record));
-    let reparsed = parse(&serialized).unwrap();
+    let reparsed = parse(&serialized).unwrap().records;
     prop_assert_eq!(vec![record], reparsed);
 }
 
@@ -723,4 +858,87 @@ fn identifier_fallback_matches_reference(input: IdentifierFields) {
         .map(|(_, value)| value.clone());
 
     prop_assert_eq!(identifier, expected);
+}
+
+// -- Lenient parsing properties --
+
+/// One entry of a generated input: a valid entry with a title, or a broken one.
+#[derive(Debug, Clone)]
+enum GeneratedEntry {
+    /// A valid entry with this key and title.
+    Valid {
+        /// The citation key, drawn from a small set so keys repeat.
+        key: String,
+        /// The title.
+        title: String,
+    },
+    /// An entry whose title brace is never closed.
+    Broken,
+}
+
+/// A valid entry (keys drawn from two letters, so they often repeat) or a broken one. Titles are
+/// words separated by single spaces, because the parser collapses runs of spaces.
+fn arb_generated_entry() -> impl Strategy<Value = GeneratedEntry> {
+    prop_oneof![
+        3 => ("[ab]", "[A-Za-z]{1,8}( [A-Za-z]{1,8}){0,3}")
+            .prop_map(|(key, title)| GeneratedEntry::Valid { key, title }),
+        1 => Just(GeneratedEntry::Broken),
+    ]
+}
+
+/// Broken entries among valid ones are skipped and reported at their lines; every valid entry is
+/// kept, in order.
+#[proptest]
+fn broken_entries_skipped(
+    #[strategy(vec(arb_generated_entry(), 1..10))] entries: Vec<GeneratedEntry>,
+) {
+    let mut input = String::new();
+    let mut expected_titles = Vec::new();
+    let mut broken_lines = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            GeneratedEntry::Valid { key, title } => {
+                writeln!(input, "@article{{{key}, title = {{{title}}}}}").unwrap();
+                expected_titles.push(Some(title.as_str()));
+            }
+            GeneratedEntry::Broken => {
+                writeln!(input, "@article{{broken, title = {{never closed").unwrap();
+                broken_lines.push(index + 1);
+            }
+        }
+    }
+
+    let parsed = parse(&input).unwrap();
+    prop_assert_eq!(titles(&parsed), expected_titles);
+    let skipped: Vec<usize> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::SkippedEntry { .. }))
+        .map(Diagnostic::line)
+        .collect();
+    prop_assert_eq!(skipped, broken_lines);
+}
+
+/// Each entry without a usable title is reported once, and diagnostics come in line order.
+#[proptest]
+fn missing_titles_reported_in_order(
+    #[strategy(vec(proptest::option::of("[A-Za-z ]{0,10}"), 1..10))] titles: Vec<Option<String>>,
+) {
+    let mut input = String::new();
+    for (index, title) in titles.iter().enumerate() {
+        match title {
+            Some(title) => writeln!(input, "@article{{k{index}, title = {{{title}}}}}").unwrap(),
+            None => writeln!(input, "@article{{k{index}, year = {{2024}}}}").unwrap(),
+        }
+    }
+    let parsed = parse(&input).unwrap();
+
+    let untitled: Vec<usize> = titles
+        .iter()
+        .enumerate()
+        .filter(|(_, title)| title.as_deref().is_none_or(|t| t.trim().is_empty()))
+        .map(|(index, _)| index + 1)
+        .collect();
+    let missing: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    prop_assert_eq!(missing, untitled);
 }

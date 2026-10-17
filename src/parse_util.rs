@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::Error;
+use crate::{Diagnostic, Error, Parsed, Record};
 
 /// Return [`Error::EmptyInput`] if `input` is empty or whitespace-only.
 pub(crate) fn check_empty(input: &str) -> Result<(), Error> {
@@ -56,4 +56,26 @@ pub(crate) fn first_non_blank<const N: usize>(candidates: [Option<String>; N]) -
         .into_iter()
         .flatten()
         .min_by_key(String::is_empty)
+}
+
+/// Report [`Diagnostic::MissingTitle`] for the record starting at `line` if its title is `None` or
+/// blank.
+pub(crate) fn report_missing_title(
+    title: Option<&str>,
+    line: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if title.is_none_or(|t| t.trim().is_empty()) {
+        diagnostics.push(Diagnostic::MissingTitle { line });
+    }
+}
+
+/// Assemble a [`Parsed`], sorting `diagnostics` by line. The sort is stable, so diagnostics on the
+/// same line keep the order in which they were found.
+pub(crate) fn parsed(records: Vec<Record>, mut diagnostics: Vec<Diagnostic>) -> Parsed {
+    diagnostics.sort_by_key(Diagnostic::line);
+    Parsed {
+        records,
+        diagnostics,
+    }
 }

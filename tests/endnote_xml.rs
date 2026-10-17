@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use test_strategy::proptest;
 
 use biblio::endnote_xml::{parse, serialize};
-use biblio::{Error, PublicationDate, Record};
+use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::{arb_author, arb_date, arb_pages, arb_volume};
 
@@ -36,11 +36,11 @@ fn single_record() {
 </records>
 </xml>"#;
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 1);
 
     let r = &records[0];
-    assert_eq!(r.title, "A test title");
+    assert_eq!(r.title.as_deref(), Some("A test title"));
     assert_eq!(r.authors, vec!["Doe, Jane", "Smith, John"]);
     assert_eq!(
         r.date,
@@ -96,10 +96,13 @@ fn multiple_records() {
 </records>
 </xml>"#;
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 2);
 
-    assert_eq!(records[0].title, "CRISPR-Cas9 gene editing");
+    assert_eq!(
+        records[0].title.as_deref(),
+        Some("CRISPR-Cas9 gene editing")
+    );
     assert_eq!(
         records[0].authors,
         vec!["Frangoul, Haydar", "Altshuler, David"]
@@ -109,8 +112,8 @@ fn multiple_records() {
     assert_eq!(records[0].isbn.as_deref(), Some("1533-4406"));
 
     assert_eq!(
-        records[1].title,
-        "Large language models in clinical medicine"
+        records[1].title.as_deref(),
+        Some("Large language models in clinical medicine")
     );
     assert_eq!(records[1].authors, vec!["Lee, Peter", "Bubeck, Sebastien"]);
     assert_eq!(records[1].isbn.as_deref(), Some("1546-170X"));
@@ -125,9 +128,9 @@ fn bare_records_root() {
 </record>
 </records>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].title, "Bare root test");
+    assert_eq!(records[0].title.as_deref(), Some("Bare root test"));
 }
 
 // -- Style tag stripping --
@@ -144,8 +147,8 @@ fn style_tags_stripped() {
 </records>
 </xml>"#;
 
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "Styled title");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("Styled title"));
     assert_eq!(records[0].abstract_text.as_deref(), Some("Styled abstract"));
 }
 
@@ -168,7 +171,7 @@ fn self_closing_elements() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].pages, None);
     assert_eq!(records[0].volume, None);
 }
@@ -181,8 +184,8 @@ fn numeric_char_ref_decoded() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "A & B");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("A & B"));
 }
 
 #[test]
@@ -195,8 +198,8 @@ fn style_prefix_not_stripped() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "Test");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("Test"));
 }
 
 #[test]
@@ -207,8 +210,8 @@ fn xml_entities_decoded() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
-    assert_eq!(records[0].title, "A & B < C");
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].title.as_deref(), Some("A & B < C"));
 }
 
 // -- Authors --
@@ -221,7 +224,7 @@ fn no_contributors() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].authors, Vec::<String>::new());
 }
 
@@ -236,7 +239,7 @@ fn date_non_numeric_ignored() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(records[0].date, None);
 }
 
@@ -249,7 +252,7 @@ fn date_year_only() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].date,
         Some(PublicationDate {
@@ -272,7 +275,7 @@ fn extras_label_and_rec_number() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].extras.get("label").map(String::as_str),
         Some("myref")
@@ -292,7 +295,7 @@ fn extras_label_only() {
 </record>
 </records></xml>";
 
-    let records = parse(input).unwrap();
+    let records = parse(input).unwrap().records;
     assert_eq!(
         records[0].extras.get("label").map(String::as_str),
         Some("onlylabel")
@@ -308,52 +311,130 @@ fn empty_input() {
     assert_eq!(parse("   \n\n  "), Err(Error::EmptyInput));
 }
 
+/// Broken XML before any record is complete fails the whole input, at the line of the error.
 #[test]
-fn malformed_xml() {
-    let result = parse("<xml><records><record><not closed");
-    assert!(result.is_err());
+fn malformed_xml_before_first_record() {
+    let result = parse("<xml><records>\n<record><titles><title>A</wrong>");
+    assert!(matches!(
+        result,
+        Err(Error::MalformedSyntax { line: 2, .. })
+    ));
 }
 
+// -- Lenient parsing --
+
+/// Titles of the parsed records, in order.
+fn titles(parsed: &biblio::Parsed) -> Vec<Option<&str>> {
+    parsed.records.iter().map(|r| r.title.as_deref()).collect()
+}
+
+/// An XML error after complete records keeps them and reports the truncation at the error's line.
 #[test]
-fn missing_title() {
+fn xml_error_after_records_truncates() {
+    let input = "\
+<xml><records>
+<record><titles><title>A</title></titles></record>
+<record><titles><title>B</title></titles></record>
+<record><titles><title>C</title></wrong>
+</records></xml>";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("B")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::Truncated { line: 4, .. }]
+    ));
+}
+
+/// Input ending inside a record keeps the complete records and reports where the unfinished one
+/// starts.
+#[test]
+fn end_inside_record_truncates() {
+    let input = "\
+<xml><records>
+<record><titles><title>A</title></titles></record>
+<record><titles><title>B";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::Truncated {
+            line: 3,
+            message: "input ended inside a record".into()
+        }]
+    );
+}
+
+/// Input ending inside the first record fails the whole input.
+#[test]
+fn end_inside_first_record_fails() {
+    let result = parse("<xml><records>\n<record><titles><title>A");
+    assert!(matches!(
+        result,
+        Err(Error::MalformedSyntax { line: 2, .. })
+    ));
+}
+
+/// Input ending right after a record, with `<records>` still open, is not truncated.
+#[test]
+fn end_after_record_not_truncated() {
+    let parsed = parse("<xml><records><record><titles><title>A</title></titles></record>").unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// Line numbers count the newlines inside removed `<style>` tags.
+#[test]
+fn lines_counted_across_style_tags() {
+    let input = "\
+<xml><records>
+<record><titles><title><style face=\"bold\"
+ size=\"100%\">A</style></title></titles></record>
+<record>
+<dates><year>2024</year></dates>
+</record>
+</records></xml>";
+    let parsed = parse(input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A"), None]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 4 }]
+    );
+}
+
+/// A record without a title is kept, and the missing title is reported at the record's line.
+#[test]
+fn missing_title_kept_and_reported() {
     let input = r"<xml><records>
 <record>
   <dates><year>2024</year></dates>
 </record>
 </records></xml>";
 
-    let err = parse(input).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::MissingRequiredField { tag: "title", .. }
-    ));
+    let parsed = parse(input).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.records[0].title, None);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 2 }]
+    );
 }
 
 // -- Serialization --
 
 #[test]
 fn serialize_multiple_records() {
-    let a = Record {
-        title: "First".into(),
-        ..Default::default()
-    };
-    let b = Record {
-        title: "Second".into(),
-        ..Default::default()
-    };
+    let a = Record::builder().title("First").build();
+    let b = Record::builder().title("Second").build();
     let output = serialize(&[a, b]);
-    let reparsed = parse(&output).unwrap();
+    let reparsed = parse(&output).unwrap().records;
     assert_eq!(reparsed.len(), 2);
-    assert_eq!(reparsed[0].title, "First");
-    assert_eq!(reparsed[1].title, "Second");
+    assert_eq!(reparsed[0].title.as_deref(), Some("First"));
+    assert_eq!(reparsed[1].title.as_deref(), Some("Second"));
 }
 
 #[test]
 fn serialize_skips_none_fields() {
-    let record = Record {
-        title: "Minimal".into(),
-        ..Default::default()
-    };
+    let record = Record::builder().title("Minimal").build();
     let output = serialize(&[record]);
     assert!(output.contains("<title>Minimal</title>"));
     assert!(!output.contains("<volume>"));
@@ -374,7 +455,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
     };
 
     (
-        arb_xml_text(80),                              // title
+        proptest::option::of(arb_xml_text(80)),        // title
         proptest::collection::vec(arb_author(), 0..5), // authors
         proptest::option::of(arb_date().prop_map(|d| {
             // EndNote XML only stores year
@@ -416,18 +497,20 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                 if let Some(rn) = rec_number {
                     extras.insert("rec-number".into(), rn);
                 }
-                Record {
-                    title,
-                    authors,
-                    date,
-                    journal,
-                    doi,
-                    pages,
-                    volume,
-                    number,
-                    abstract_text,
-                    isbn,
-                    extras,
+                {
+                    let mut record = Record::default();
+                    record.title = title;
+                    record.authors = authors;
+                    record.date = date;
+                    record.journal = journal;
+                    record.doi = doi;
+                    record.pages = pages;
+                    record.volume = volume;
+                    record.number = number;
+                    record.abstract_text = abstract_text;
+                    record.isbn = isbn;
+                    record.extras = extras;
+                    record
                 }
             },
         )
@@ -445,7 +528,7 @@ fn parse_never_panics(#[strategy("\\PC{0,500}")] s: String) {
 #[proptest]
 fn serialize_round_trip(#[strategy(arb_endnote_record())] record: Record) {
     let serialized = serialize(std::slice::from_ref(&record));
-    let reparsed = parse(&serialized).unwrap();
+    let reparsed = parse(&serialized).unwrap().records;
     prop_assert_eq!(vec![record], reparsed);
 }
 
@@ -459,4 +542,78 @@ fn adversarial_parse_no_panic(
 ) {
     let input = format!("{prefix}{body}{suffix}");
     let _ = parse(&input);
+}
+
+// -- Lenient parsing properties --
+
+/// Cutting a serialised file anywhere keeps exactly the records completed before the cut. A cut
+/// inside a record or tag is reported as truncation, or fails the input if no record is complete.
+#[proptest]
+fn truncation_keeps_complete_records(
+    #[strategy(proptest::collection::vec(arb_endnote_record(), 1..4))] records: Vec<Record>,
+    cut: proptest::sample::Index,
+) {
+    let serialized = serialize(&records);
+    let mut end = 1 + cut.index(serialized.len());
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &serialized[..end];
+
+    // The serialiser escapes `<`, `>` and `&` in text and writes nothing between elements, so the
+    // prefix ends inside markup or text exactly when it does not end with `>` or when a record has
+    // been opened but not closed.
+    let complete = prefix.matches("</record>").count();
+    let opened = prefix.matches("<record>").count();
+    let broken_off = !prefix.ends_with('>') || opened > complete;
+
+    match parse(prefix) {
+        Ok(parsed) => {
+            prop_assert!(complete > 0 || !broken_off);
+            prop_assert_eq!(&parsed.records[..], &records[..complete]);
+            let truncations: Vec<usize> = parsed
+                .diagnostics
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| matches!(d, Diagnostic::Truncated { .. }))
+                .map(|(index, _)| index)
+                .collect();
+            if broken_off {
+                prop_assert_eq!(truncations, vec![parsed.diagnostics.len() - 1]);
+            } else {
+                prop_assert!(truncations.is_empty());
+            }
+        }
+        Err(error) => {
+            prop_assert!(broken_off && complete == 0, "unexpected error {error}");
+            let malformed = matches!(error, Error::MalformedSyntax { .. });
+            prop_assert!(malformed);
+        }
+    }
+}
+
+/// Each record without a title is reported once, and diagnostics come in line order.
+#[proptest]
+fn missing_titles_reported_in_order(
+    #[strategy(proptest::collection::vec(proptest::bool::ANY, 1..8))] titled: Vec<bool>,
+) {
+    let mut input = String::from("<xml><records>\n");
+    for has_title in &titled {
+        if *has_title {
+            input.push_str("<record><titles><title>T</title></titles></record>\n");
+        } else {
+            input.push_str("<record><dates><year>2024</year></dates></record>\n");
+        }
+    }
+    input.push_str("</records></xml>");
+    let parsed = parse(&input).unwrap();
+
+    let untitled: Vec<usize> = titled
+        .iter()
+        .enumerate()
+        .filter(|(_, has_title)| !**has_title)
+        .map(|(index, _)| index + 2)
+        .collect();
+    let missing: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    prop_assert_eq!(missing, untitled);
 }

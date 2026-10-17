@@ -1,0 +1,80 @@
+use biblio::{Diagnostic, PublicationDate, Record};
+
+/// Every builder method sets its own field, and `authors` appends after `author`.
+#[test]
+fn builder_sets_every_field() {
+    let date = PublicationDate {
+        year: 2024,
+        month: Some(9),
+        day: None,
+    };
+    let record = Record::builder()
+        .title("A title")
+        .author("Doe, Jane")
+        .authors(["Smith, John", "Roe, Rick"])
+        .date(date)
+        .journal("Nature")
+        .doi("10.1000/xyz")
+        .pages("1-10")
+        .volume("12")
+        .number("3")
+        .abstract_text("An abstract.")
+        .isbn("1234-5678")
+        .extra("PMID", "123")
+        .build();
+
+    assert_eq!(record.title.as_deref(), Some("A title"));
+    assert_eq!(
+        record.authors,
+        vec!["Doe, Jane", "Smith, John", "Roe, Rick"]
+    );
+    assert_eq!(record.date, Some(date));
+    assert_eq!(record.journal.as_deref(), Some("Nature"));
+    assert_eq!(record.doi.as_deref(), Some("10.1000/xyz"));
+    assert_eq!(record.pages.as_deref(), Some("1-10"));
+    assert_eq!(record.volume.as_deref(), Some("12"));
+    assert_eq!(record.number.as_deref(), Some("3"));
+    assert_eq!(record.abstract_text.as_deref(), Some("An abstract."));
+    assert_eq!(record.isbn.as_deref(), Some("1234-5678"));
+    assert_eq!(record.extras.get("PMID").map(String::as_str), Some("123"));
+}
+
+/// A builder with nothing set gives the empty record.
+#[test]
+fn empty_builder_gives_default_record() {
+    assert_eq!(Record::builder().build(), Record::default());
+}
+
+/// Every diagnostic reports its line and describes itself.
+#[test]
+fn diagnostic_line_and_display() {
+    let cases = [
+        (
+            Diagnostic::MissingTitle { line: 1 },
+            "record at line 1 has no title",
+        ),
+        (
+            Diagnostic::UnterminatedRecord { line: 2 },
+            "record at line 2 was not closed with ER",
+        ),
+        (Diagnostic::IgnoredLine { line: 3 }, "ignored line 3"),
+        (
+            Diagnostic::SkippedEntry {
+                line: 4,
+                message: "expected comma".into(),
+            },
+            "skipped entry at line 4: expected comma",
+        ),
+        (
+            Diagnostic::Truncated {
+                line: 5,
+                message: "input ended inside a record".into(),
+            },
+            "input truncated at line 5: input ended inside a record",
+        ),
+    ];
+    for (expected_line, (diagnostic, text)) in (1..).zip(cases) {
+        assert_eq!(diagnostic.line(), expected_line);
+        assert_eq!(diagnostic.to_string(), text);
+    }
+}
