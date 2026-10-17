@@ -30,38 +30,48 @@ let bibtex_input = r#"
 }
 "#;
 
-let records = bibtex::parse(bibtex_input).unwrap();
-let ris_output = ris::serialize(&records);
+let parsed = bibtex::parse(bibtex_input).unwrap();
+let ris_output = ris::serialize(&parsed.records);
 println!("{ris_output}");
 ```
 
 Every format module exposes the same two-function interface:
 
 ```rust
-fn parse(input: &str) -> Result<Vec<Record>, Error>;
+fn parse(input: &str) -> Result<Parsed, Error>;
 fn serialize(records: &[Record]) -> String;
 ```
 
 ## The `Record` type
 
-`Record` is a plain struct with public fields – no builder, no hidden state:
+`Record` has public fields and is built with `Record::builder()`:
 
 ```rust
 use biblio::{Record, PublicationDate};
 
-let rec = Record {
-    title: "My paper".into(),
-    authors: vec!["Doe, Jane".into()],
-    date: Some(PublicationDate { year: 2024, month: None, day: None }),
-    ..Default::default()
-};
+let rec = Record::builder()
+    .title("My paper")
+    .author("Doe, Jane")
+    .date(PublicationDate { year: 2024, month: None, day: None })
+    .build();
 ```
 
-Fields that don't map neatly to the common schema (PMID, PMCID, citation key, etc.) land in `extras: HashMap<String, String>` so nothing is silently dropped.
+`Record`, `Parsed`, `Diagnostic` and `Error` are `#[non_exhaustive]`, so fields and variants can be added without breaking your code: build records with the builder, and give a `match` on `Diagnostic` or `Error` a wildcard arm.
 
-## Error handling
+The title is optional, because some records have none. A few format-specific values (PMID, PMCID, citation key, etc.) land in `extras: HashMap<String, String>`; fields that `biblio` does not read yet are not kept.
 
-All parsers return `Result<Vec<Record>, biblio::Error>`. The error type distinguishes empty input, missing required fields (with the offending tag name and line number), malformed syntax, and internal errors.
+## Errors and diagnostics
+
+A bad record does not reject the whole file. Each parser keeps every record it can read and returns a `Parsed` with the `records` and a list of `diagnostics`, sorted by line, describing what it had to drop or patch: records without a title, `RIS` records not closed with `ER`, lines that belong to no record, `BibTeX` entries that could not be parsed, and `EndNote XML` that breaks off part way.
+
+```rust
+let parsed = biblio::ris::parse(input)?;
+for diagnostic in &parsed.diagnostics {
+    eprintln!("{diagnostic}");
+}
+```
+
+`Err` is kept for problems with the whole input: empty input, or `EndNote XML` that breaks off before any record is complete.
 
 ## License
 

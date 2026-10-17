@@ -13,16 +13,22 @@ use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
+    report_missing_title,
 };
-use crate::{Error, PublicationDate, Record};
+use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
 /// Parse `NBIB`-formatted text into zero or more [`Record`]s.
+///
+/// Every record is kept, even one without a title. Problems are reported as diagnostics:
+///
+/// - [`Diagnostic::MissingTitle`]: a record has no `TI` or `BTI`, or only a blank one.
+/// - [`Diagnostic::IgnoredLine`]: a line that is not a tag line, a continuation line or blank, or a
+///   continuation line with no tag before it in its record.
 ///
 /// # Errors
 ///
 /// Returns [`Error::EmptyInput`] if the input is empty or whitespace-only.
-/// Returns [`Error::MissingRequiredField`] if a record lacks a title (`TI` or `BTI`).
 ///
 /// # Title and journal
 ///
@@ -30,12 +36,13 @@ use crate::{Error, PublicationDate, Record};
 /// `TI`. The journal is read from `JT`, falling back to the collection title (`CTI`), the series a
 /// book belongs to. The collection title is never used as a title, because unrelated books in the
 /// same series share it. A blank tag never hides its fallback when the fallback has a value.
-pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
+pub fn parse(input: &str) -> Result<Parsed, Error> {
     check_empty(input)?;
     let input = normalize_line_endings(input);
 
     let mut records = Vec::new();
-    let mut builder = RecordBuilder::default();
+    let mut diagnostics = Vec::new();
+    let mut pending = PendingRecord::default();
     let mut has_content = false;
 
     // Each NBIB line is one of three kinds:
@@ -48,8 +55,7 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
         // Blank line – finalize the current record (if any) and start a new one.
         if line.trim().is_empty() {
             if has_content {
-                records.push(builder.finish()?);
-                builder = RecordBuilder::default();
+                records.push(std::mem::take(&mut pending).finish(&mut diagnostics));
                 has_content = false;
             }
             continue;
@@ -57,29 +63,36 @@ pub fn parse(input: &str) -> Result<Vec<Record>, Error> {
 
         // Continuation line – append to whatever field the previous tag started.
         if line.starts_with("      ") {
-            builder.append_continuation(line.trim());
+            if !pending.append_continuation(line.trim()) {
+                diagnostics.push(Diagnostic::IgnoredLine { line: line_number });
+            }
             continue;
         }
 
         // Tag line – parse the tag and value, then route to the appropriate field.
         if let Ok((tag, value)) = tag_line.parse(line) {
             if !has_content {
-                builder.line_start = line_number;
+                pending.line_start = line_number;
                 has_content = true;
             }
-            builder.dispatch(tag, value);
+            pending.dispatch(tag, value);
+        } else {
+            diagnostics.push(Diagnostic::IgnoredLine { line: line_number });
         }
     }
 
     // The last record may not be followed by a blank line.
     if has_content {
-        records.push(builder.finish()?);
+        records.push(pending.finish(&mut diagnostics));
     }
 
-    Ok(records)
+    Ok(parsed(records, diagnostics))
 }
 
 /// Serialize [`Record`]s to `NBIB` format.
+///
+/// A record with none of the fields written here has no lines, so it is not read back by
+/// [`parse`].
 ///
 /// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
 /// suffix. Records are separated by blank lines.
@@ -98,7 +111,9 @@ pub fn serialize(records: &[Record]) -> String {
             write_field(&mut buf, key, value);
         }
 
-        write_field(&mut buf, "TI", &record.title);
+        if let Some(title) = &record.title {
+            write_field(&mut buf, "TI", title);
+        }
 
         for author in &record.authors {
             write_field(&mut buf, "FAU", author);
@@ -237,8 +252,10 @@ fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> 
     Ok((tag, value.trim_end()))
 }
 
+/// A record being read, before its fields are combined into a [`Record`].
 #[derive(Default)]
-struct RecordBuilder {
+struct PendingRecord {
+    /// Line of the record's first tag.
     line_start: usize,
     title: Option<String>,
     /// Book title (`BTI`), the title of a book, which has no `TI`.
@@ -260,7 +277,7 @@ struct RecordBuilder {
     last_tag: Option<String>,
 }
 
-impl RecordBuilder {
+impl PendingRecord {
     fn dispatch(&mut self, tag: &str, value: &str) {
         match tag {
             "TI" => self.title = Some(value.to_owned()),
@@ -284,9 +301,11 @@ impl RecordBuilder {
         self.last_tag = Some(tag.to_owned());
     }
 
-    fn append_continuation(&mut self, text: &str) {
+    /// Append a continuation line to the field of the previous tag. Returns `false` if there is no
+    /// previous tag to continue; a tag whose field is not read still takes its continuation lines.
+    fn append_continuation(&mut self, text: &str) -> bool {
         let Some(tag) = self.last_tag.as_deref() else {
-            return;
+            return false;
         };
         match tag {
             "TI" => append_to_opt(&mut self.title, text),
@@ -299,14 +318,13 @@ impl RecordBuilder {
             "LID" | "AID" => append_to_last(&mut self.doi_candidates, text),
             _ => {}
         }
+        true
     }
 
-    fn finish(self) -> Result<Record, Error> {
-        let title =
-            first_non_blank([self.title, self.book_title]).ok_or(Error::MissingRequiredField {
-                tag: "TI",
-                line: self.line_start,
-            })?;
+    /// Combine the fields into a [`Record`], reporting a missing title.
+    fn finish(self, diagnostics: &mut Vec<Diagnostic>) -> Record {
+        let title = first_non_blank([self.title, self.book_title]);
+        report_missing_title(title.as_deref(), self.line_start, diagnostics);
 
         let authors = if self.fau_authors.is_empty() {
             self.au_authors
@@ -316,7 +334,7 @@ impl RecordBuilder {
 
         let doi = extract_doi(&self.doi_candidates);
 
-        Ok(Record {
+        Record {
             title,
             authors,
             date: self.date,
@@ -328,6 +346,6 @@ impl RecordBuilder {
             abstract_text: self.abstract_text,
             isbn: self.isbn,
             extras: self.extras,
-        })
+        }
     }
 }
