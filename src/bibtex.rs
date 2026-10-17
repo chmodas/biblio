@@ -12,15 +12,15 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use biblatex::{
-    Bibliography, ChunksExt, Date, DateValue, PermissiveType, Person, RawBibliography, RawEntry,
-    Spanned,
+    Bibliography, ChunksExt, Date, DateValue, EntryType, PermissiveType, Person, RawBibliography,
+    RawEntry, Spanned,
 };
 use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{one_of, take_while};
 
 use crate::parse_util::{
-    check_empty, first_non_blank, parsed, report_missing_title, strip_byte_order_mark,
+    check_empty, first_non_blank, own_extras, parsed, report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -50,6 +50,18 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///
 /// Returns [`Error::EmptyInput`] if the input, after any leading byte-order mark, is empty or
 /// whitespace-only.
+///
+/// # Extras
+///
+/// Every field without a slot is kept in [`Record::extras`] as `"bibtex:{name}"` (names in lower
+/// case), with the citation key as `"bibtex:@key"` and the entry type as `"bibtex:@type"`. Values
+/// are read as the underlying parser formats them: macros are expanded (`month = jan` gives
+/// `"January"`), braces are removed and whitespace is collapsed, so a value may change once when it
+/// is first read. A `crossref` child's extras include the fields it inherits, and `crossref` itself
+/// is kept; `xdata` is consumed while resolving and is not kept. A field that appears twice keeps
+/// its last value. Fields that are read but lose to another are dropped: `issn` when `isbn` is
+/// present, `journal` when `journaltitle` is present, `year` when `date` is present, and values of
+/// `year` or `author` that cannot be read.
 ///
 /// # Identifiers
 ///
@@ -193,20 +205,40 @@ fn lines_of(input: &str, offsets: &[usize]) -> Vec<usize> {
 
 /// Serialize [`Record`]s to `BibTeX` format.
 ///
-/// Each record is emitted as an `@article` entry. The citation key is taken from `extras["key"]`,
-/// falling back to `"unknown"`.
+/// The entry type and citation key come from `extras["bibtex:@type"]` and `extras["bibtex:@key"]`,
+/// falling back to `article` and `unknown` when absent or not valid. Other `bibtex:` extras are
+/// written as fields after the first-class fields, sorted by name, using only their first value;
+/// names that are not valid field names, and fields the parser reads, are skipped. A `crossref`
+/// that would close a cycle among the records written (to the entry itself, directly or through an
+/// `ids` alias, or through other entries) is skipped too, because such an entry cannot be resolved.
+/// Extras of other formats are not written.
+///
+/// Values are escaped so that braces, backslashes and `$` read back unchanged: `\`, `{` and `}`
+/// everywhere, and `$` except in verbatim fields such as `url` and `doi`. The parser still turns
+/// `--` into a dash and collapses whitespace.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut out = String::new();
+    let cyclic = cyclic_crossrefs(records);
 
     for (i, record) in records.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
 
-        let key = record.extras.get("key").map_or("unknown", String::as_str);
+        let first_extra = |name: &str| first_extra(record, name);
+        let entry_type = first_extra("bibtex:@type")
+            .filter(|t| {
+                is_identifier(t)
+                    && !matches!(
+                        t.to_ascii_lowercase().as_str(),
+                        "comment" | "string" | "preamble"
+                    )
+            })
+            .unwrap_or("article");
+        let key = entry_key(record);
 
-        let _ = writeln!(out, "@article{{{key},");
+        let _ = writeln!(out, "@{entry_type}{{{key},");
 
         if let Some(title) = &record.title {
             emit(&mut out, "title", title);
@@ -216,10 +248,12 @@ pub fn serialize(records: &[Record]) -> String {
             emit(&mut out, "author", &record.authors.join(" and "));
         }
 
+        let mut wrote_month = false;
         if let Some(date) = record.date {
             emit(&mut out, "year", &date.year.to_string());
             if let Some(m) = date.month {
                 emit(&mut out, "month", &m.to_string());
+                wrote_month = true;
             }
         }
 
@@ -251,14 +285,151 @@ pub fn serialize(records: &[Record]) -> String {
             emit(&mut out, "isbn", isbn);
         }
 
+        for (name, values) in own_extras(&record.extras, "bibtex") {
+            let Some(value) = values.first() else {
+                continue;
+            };
+            if !is_identifier(name) || name.bytes().any(|b| b.is_ascii_uppercase()) {
+                continue;
+            }
+            // Fields written above, or read back into them.
+            if is_read_field(name) || (name == "month" && wrote_month) {
+                continue;
+            }
+            // An entry on a crossref cycle cannot be resolved.
+            if name == "crossref" && cyclic[i] {
+                continue;
+            }
+            emit(&mut out, name, value);
+        }
+
         out.push_str("}\n");
     }
 
     out
 }
 
+/// The first value of `record`'s extra `name`, if any.
+fn first_extra<'a>(record: &'a Record, name: &str) -> Option<&'a str> {
+    record
+        .extras
+        .get(name)
+        .and_then(|values| values.first())
+        .map(String::as_str)
+}
+
+/// The citation key written for `record`: `bibtex:@key` if it is a valid key, otherwise `unknown`.
+fn entry_key(record: &Record) -> &str {
+    first_extra(record, "bibtex:@key")
+        .filter(|key| is_key(key))
+        .unwrap_or("unknown")
+}
+
+/// The names `record` can be referred to by once written: its key and its `ids` aliases.
+fn entry_names(record: &Record) -> impl Iterator<Item = &str> {
+    let aliases = first_extra(record, "bibtex:ids")
+        .into_iter()
+        .flat_map(|ids| ids.split(',').map(str::trim));
+    std::iter::once(entry_key(record)).chain(aliases)
+}
+
+/// For each record, whether the `crossref` it would write lies on a cycle among `records`, so that
+/// resolving it would never end. Dropping the `crossref` of every record on a cycle breaks it.
+fn cyclic_crossrefs(records: &[Record]) -> Vec<bool> {
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        for name in entry_names(record) {
+            by_name.entry(name).or_insert(index);
+        }
+    }
+    let crossref = |index: usize| first_extra(&records[index], "bibtex:crossref");
+
+    (0..records.len())
+        .map(|start| {
+            let Some(target) = crossref(start) else {
+                return false;
+            };
+            if entry_names(&records[start]).any(|name| name == target) {
+                return true;
+            }
+            // Follow the chain; a cycle through `start` returns to it within `records.len()` steps.
+            let mut next = by_name.get(target).copied();
+            for _ in 0..records.len() {
+                match next {
+                    Some(index) if index == start => return true,
+                    Some(index) => next = crossref(index).and_then(|t| by_name.get(t).copied()),
+                    None => return false,
+                }
+            }
+            false
+        })
+        .collect()
+}
+
+/// Fields whose value `biblatex` reads verbatim, without `$` math. Mirrors the crate's private
+/// list, so `$` is not escaped in them.
+const VERBATIM_FIELDS: [&str; 10] = [
+    "file", "doi", "uri", "eprint", "verba", "verbb", "verbc", "pdf", "url", "urlraw",
+];
+
+/// Write one field, escaping the value so that it reads back unchanged.
 fn emit(out: &mut String, field: &str, value: &str) {
-    let _ = writeln!(out, "  {field} = {{{value}}},");
+    let verbatim = VERBATIM_FIELDS.contains(&field);
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '\\' | '{' | '}') || (c == '$' && !verbatim) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    let _ = writeln!(out, "  {field} = {{{escaped}}},");
+}
+
+/// Whether the parser reads field `name` into a first-class field, or `biblatex` consumes it while
+/// resolving (`xdata`), rather than keeping it in `extras`. The serialiser never writes such a
+/// field from `extras`.
+fn is_read_field(name: &str) -> bool {
+    matches!(
+        name,
+        "title"
+            | "author"
+            | "date"
+            | "year"
+            | "journaltitle"
+            | "journal"
+            | "doi"
+            | "pages"
+            | "volume"
+            | "number"
+            | "abstract"
+            | "isbn"
+            | "issn"
+            | "xdata"
+    )
+}
+
+/// Whether `name` is an identifier `biblatex` accepts as an entry type or field name: not empty,
+/// not starting with `:`, `<`, `-` or `>`, and free of whitespace, control characters and
+/// `@{}"#'(),=%\~`.
+fn is_identifier(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|first| !matches!(first, ':' | '<' | '-' | '>'))
+        && !name.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    '@' | '{' | '}' | '"' | '#' | '\'' | '(' | ')' | ',' | '=' | '%' | '\\' | '~'
+                )
+        })
+}
+
+/// Whether `key` is a citation key `biblatex` accepts: free of `,`, `}`, whitespace and control
+/// characters. The empty key is allowed.
+fn is_key(key: &str) -> bool {
+    !key.chars()
+        .any(|c| c == ',' || c == '}' || c.is_whitespace() || c.is_control())
 }
 
 /// Map a parsed entry starting at `line` to a [`Record`], reporting a missing title.
@@ -267,8 +438,19 @@ fn record_from_entry(
     line: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Record {
-    let mut extras = HashMap::new();
-    extras.insert("key".into(), entry.key.clone());
+    let mut extras: HashMap<String, Vec<String>> = entry
+        .fields
+        .iter()
+        .filter(|(name, _)| !is_read_field(name))
+        .map(|(name, chunks)| (format!("bibtex:{name}"), vec![chunks.format_verbatim()]))
+        .collect();
+    extras.insert("bibtex:@key".into(), vec![entry.key.clone()]);
+    let entry_type = match &entry.entry_type {
+        // `Display` prints every unknown type as "unknown", losing its name.
+        EntryType::Unknown(name) if !name.is_empty() => name.clone(),
+        known => known.to_string(),
+    };
+    extras.insert("bibtex:@type".into(), vec![entry_type]);
 
     let title = entry.get("title").map(ChunksExt::format_verbatim);
     report_missing_title(title.as_deref(), line, diagnostics);

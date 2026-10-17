@@ -115,9 +115,23 @@ pub struct Record {
     /// format provides.
     pub isbn: Option<String>,
 
-    /// Format-specific metadata not captured by the common fields above (e.g. PMID, PMCID for
-    /// `NBIB`; citation key for `BibTeX`).
-    pub extras: HashMap<String, String>,
+    /// Every field of the source that has no slot above, keyed by format and tag, with its values
+    /// in source order.
+    ///
+    /// Keys have the form `"{format}:{tag}"`, so values from different formats never collide:
+    ///
+    /// - `RIS`: `"ris:KW"`, `"ris:UR"`, …, plus `"ris:TY"` for the record type.
+    /// - `NBIB`: `"nbib:PMID"`, `"nbib:OT"`, ….
+    /// - `BibTeX`: `"bibtex:note"`, `"bibtex:keywords"`, … (field names in lower case), plus
+    ///   `"bibtex:@key"` for the citation key and `"bibtex:@type"` for the entry type. A field name
+    ///   cannot contain `@`, so these never clash with a real field.
+    /// - `EndNote XML`: the element path below `<record>`, e.g. `"endnote:keywords/keyword"`.
+    ///
+    /// Each serialiser writes only the keys of its own format, so values read from one format are
+    /// kept on the record but not written to another. It skips keys that are not valid tags in its
+    /// format, and keys for tags it reads into the fields above. `BibTeX` writes only the first
+    /// value of a key, because a field can appear only once in an entry.
+    pub extras: HashMap<String, Vec<String>>,
 }
 
 impl Record {
@@ -217,10 +231,15 @@ impl RecordBuilder {
         self
     }
 
-    /// Insert one format-specific value into `extras`, replacing any value already under `key`.
+    /// Append one value to `key` in `extras`. Keys follow the scheme described on
+    /// [`Record::extras`], e.g. `"ris:KW"`.
     #[must_use]
     pub fn extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.record.extras.insert(key.into(), value.into());
+        self.record
+            .extras
+            .entry(key.into())
+            .or_default()
+            .push(value.into());
         self
     }
 

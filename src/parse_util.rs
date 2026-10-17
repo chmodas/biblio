@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::{Diagnostic, Error, Parsed, Record};
 
@@ -85,4 +86,26 @@ pub(crate) fn parsed(records: Vec<Record>, mut diagnostics: Vec<Diagnostic>) -> 
         records,
         diagnostics,
     }
+}
+
+/// Append `value` to the `extras` list under `key`.
+pub(crate) fn push_extra(extras: &mut HashMap<String, Vec<String>>, key: String, value: &str) {
+    extras.entry(key).or_default().push(value.to_owned());
+}
+
+/// The extras in `format`'s namespace, as `(tag, values)` pairs sorted by tag. The tag is the key
+/// without its `"{format}:"` prefix.
+pub(crate) fn own_extras<'a>(
+    extras: &'a HashMap<String, Vec<String>>,
+    format: &str,
+) -> Vec<(&'a str, &'a [String])> {
+    let mut own: Vec<(&str, &[String])> = extras
+        .iter()
+        .filter_map(|(key, values)| {
+            let tag = key.strip_prefix(format)?.strip_prefix(':')?;
+            Some((tag, values.as_slice()))
+        })
+        .collect();
+    own.sort_unstable_by_key(|&(tag, _)| tag);
+    own
 }

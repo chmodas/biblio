@@ -13,8 +13,8 @@ use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
-    report_missing_title, strip_byte_order_mark,
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+    own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -27,6 +27,14 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///   continuation line with no tag before it in its record.
 ///
 /// A leading byte-order mark is ignored.
+///
+/// # Extras
+///
+/// Every tag without a field is kept in [`Record::extras`] as `"nbib:{tag}"` (e.g. `"nbib:PMID"`,
+/// `"nbib:OT"`), one value per occurrence, with its continuation lines joined. Tags that are read
+/// but lose to another are dropped: `AU` when `FAU` is present, `BTI` when `TI` is present, `CTI`
+/// when `JT` is present, `LID` and `AID` values that are not the DOI, all but the last `IS`, and
+/// dates in `DP` that cannot be read.
 ///
 /// # Errors
 ///
@@ -99,7 +107,9 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// [`parse`].
 ///
 /// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
-/// suffix. Records are separated by blank lines.
+/// suffix. `nbib:` extras are written as tags before the fields, `PMID` first and the rest sorted
+/// by tag; keys that are not 2–4 character tags, and tags the parser reads into fields, are
+/// skipped. Extras of other formats are not written. Records are separated by blank lines.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -109,10 +119,14 @@ pub fn serialize(records: &[Record]) -> String {
             buf.push('\n');
         }
 
-        let mut extras_sorted: Vec<_> = record.extras.iter().collect();
-        extras_sorted.sort_by_key(|(k, _)| k.as_str());
-        for (key, value) in extras_sorted {
-            write_field(&mut buf, key, value);
+        // Extras of this format: PMID first, as PubMed writes it, then the rest sorted by tag.
+        let mut extras = own_extras(&record.extras, "nbib");
+        extras.retain(|&(tag, _)| is_tag_shape(tag) && !is_read_tag(tag));
+        extras.sort_by_key(|&(tag, _)| tag != "PMID");
+        for (tag, values) in extras {
+            for value in values {
+                write_field(&mut buf, tag, value);
+            }
         }
 
         if let Some(title) = &record.title {
@@ -256,6 +270,35 @@ fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> 
     Ok((tag, value.trim_end()))
 }
 
+/// Whether the parser reads `tag` into a field, rather than keeping it in `extras`. The serialiser
+/// never writes such a tag from `extras`.
+fn is_read_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "TI" | "BTI"
+            | "CTI"
+            | "FAU"
+            | "AU"
+            | "DP"
+            | "JT"
+            | "LID"
+            | "AID"
+            | "PG"
+            | "VI"
+            | "IP"
+            | "AB"
+            | "IS"
+    )
+}
+
+/// Whether `tag` has the shape of an `NBIB` tag: two to four uppercase ASCII letters or digits.
+fn is_tag_shape(tag: &str) -> bool {
+    (2..=4).contains(&tag.len())
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 /// A record being read, before its fields are combined into a [`Record`].
 #[derive(Default)]
 struct PendingRecord {
@@ -277,7 +320,8 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
-    extras: HashMap<String, String>,
+    /// Values of tags that are not read into a field, keyed `"nbib:{tag}"`.
+    extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
 }
 
@@ -297,10 +341,8 @@ impl PendingRecord {
             "IP" => self.number = Some(value.to_owned()),
             "AB" => self.abstract_text = Some(value.to_owned()),
             "IS" => self.isbn = Some(value.to_owned()),
-            "PMID" | "PMC" => {
-                self.extras.insert(tag.to_owned(), value.to_owned());
-            }
-            _ => {}
+            // Keep this list in step with `is_read_tag`.
+            _ => push_extra(&mut self.extras, format!("nbib:{tag}"), value),
         }
         self.last_tag = Some(tag.to_owned());
     }
@@ -320,7 +362,11 @@ impl PendingRecord {
             "FAU" => append_to_last(&mut self.fau_authors, text),
             "AU" => append_to_last(&mut self.au_authors, text),
             "LID" | "AID" => append_to_last(&mut self.doi_candidates, text),
-            _ => {}
+            _ => {
+                if let Some(values) = self.extras.get_mut(&format!("nbib:{tag}")) {
+                    append_to_last(values, text);
+                }
+            }
         }
         true
     }

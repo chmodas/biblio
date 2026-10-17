@@ -11,7 +11,9 @@ use std::ops::ControlFlow;
 use quick_xml::events::{BytesCData, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 
-use crate::parse_util::{check_empty, parsed, report_missing_title, strip_byte_order_mark};
+use crate::parse_util::{
+    check_empty, own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
+};
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
 /// Parse `EndNote XML` text into zero or more [`Record`]s.
@@ -27,6 +29,16 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///
 /// Unknown entities such as `&foo;` are dropped without a diagnostic, and a `<record>` nested
 /// inside another replaces the outer one without a diagnostic.
+///
+/// # Extras
+///
+/// The text of every element without a field is kept in [`Record::extras`] under its element path
+/// below `<record>`, e.g. `"endnote:keywords/keyword"`, one value per element. Fields are matched
+/// by the end of their path: any path ending in `pages` fills the pages, for instance, while
+/// `titles/secondary-title` and `dates/pub-dates/date` become extras. Only elements without child
+/// elements hold values, and empty ones are skipped. Attributes, such as the name in
+/// `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year` that cannot be read are
+/// dropped.
 ///
 /// A leading byte-order mark is ignored.
 ///
@@ -81,6 +93,9 @@ struct Walker<'a> {
     path: Vec<String>,
     /// Text collected for the current element.
     buf: String,
+    /// Whether the element now ending has no child elements, so its text is a value. Containers'
+    /// text is only the whitespace between their children.
+    leaf: bool,
     /// The line and message of the problem that stopped parsing, if any.
     failure: Option<(usize, String)>,
 }
@@ -98,6 +113,7 @@ impl<'a> Walker<'a> {
             pending: None,
             path: Vec::new(),
             buf: String::new(),
+            leaf: false,
             failure: None,
         }
     }
@@ -133,14 +149,17 @@ impl<'a> Walker<'a> {
         match event {
             Event::Start(e) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if name == "record" {
+                let is_record = name == "record";
+                self.path.push(name);
+                if is_record {
                     self.pending = Some(PendingRecord {
                         line_start: self.line_at(position),
+                        depth: self.path.len(),
                         ..PendingRecord::default()
                     });
                 }
-                self.path.push(name);
                 self.buf.clear();
+                self.leaf = true;
             }
             Event::End(e) => {
                 if e.name().as_ref() == b"record" {
@@ -148,11 +167,14 @@ impl<'a> Walker<'a> {
                         let record = pending.finish(&mut self.diagnostics);
                         self.records.push(record);
                     }
-                } else if let Some(pending) = self.pending.as_mut() {
-                    pending.set_field(&self.path, &self.buf);
+                } else if self.leaf {
+                    if let Some(pending) = self.pending.as_mut() {
+                        pending.set_field(&self.path[pending.depth..], &self.buf);
+                    }
                 }
                 self.path.pop();
                 self.buf.clear();
+                self.leaf = false;
             }
             Event::Text(e) => {
                 if self.pending.is_some() {
@@ -178,6 +200,8 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
+            // A self-closing child makes its parent a container, not a value.
+            Event::Empty(_) => self.leaf = false,
             Event::Eof => {
                 // Unclosed <records> or <xml> are harmless; an unclosed <record> is not.
                 if let Some(pending) = &self.pending {
@@ -216,7 +240,11 @@ impl<'a> Walker<'a> {
 /// Serialize [`Record`]s to `EndNote XML` format.
 ///
 /// Produces a well-formed XML document with `<xml><records>...</records></xml>` structure. Text
-/// values are CDATA-escaped.
+/// values are CDATA-escaped. `endnote:` extras are written after the fields as nested elements, one
+/// block per key, sorted by path, with one element per non-empty value; a key may therefore add a
+/// second container such as `<titles>`. Paths with an empty or non-ASCII element name, with a
+/// `record` or `style` element, or that the parser reads into a field are skipped, so some paths
+/// that parsing produces are not written. Extras of other formats are not written.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -248,10 +276,6 @@ pub fn serialize(records: &[Record]) -> String {
 
 fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
     let _ = writer.write_event(Event::Start(BytesStart::new("record")));
-
-    if let Some(rn) = record.extras.get("rec-number") {
-        write_simple_element(writer, "rec-number", rn);
-    }
 
     // <titles><title>...</title></titles>
     if let Some(title) = &record.title {
@@ -306,11 +330,41 @@ fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
         write_simple_element(writer, "isbn", isbn);
     }
 
-    if let Some(label) = record.extras.get("label") {
-        write_simple_element(writer, "label", label);
+    // Extras of this format, one block of nested elements per key, sorted by path.
+    for (path, values) in own_extras(&record.extras, "endnote") {
+        let segments: Vec<&str> = path.split('/').collect();
+        let values: Vec<&String> = values.iter().filter(|value| !value.is_empty()).collect();
+        if values.is_empty()
+            || !segments.iter().all(|segment| is_writable_name(segment))
+            || read_field(&segments).is_some()
+        {
+            continue;
+        }
+        let (leaf, containers) = segments.split_last().unwrap_or((&"", &[]));
+        for container in containers {
+            let _ = writer.write_event(Event::Start(BytesStart::new(*container)));
+        }
+        for value in values {
+            write_simple_element(writer, leaf, value);
+        }
+        for container in containers.iter().rev() {
+            let _ = writer.write_event(Event::End(BytesEnd::new(*container)));
+        }
     }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("record")));
+}
+
+/// Whether `segment` can be written as an element name in an extras path: an ASCII XML name, and
+/// not `record` (which would start a new record) or `style` (which is stripped when parsing).
+fn is_writable_name(segment: &str) -> bool {
+    let mut bytes = segment.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+        && segment != "record"
+        && segment != "style"
 }
 
 fn write_simple_element(writer: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
@@ -380,7 +434,8 @@ fn is_style_opening(text: &str) -> bool {
 struct PendingRecord {
     /// Line of the record's `<record>` tag.
     line_start: usize,
-    rec_number: Option<String>,
+    /// Length of the element path up to and including `<record>`; the rest names a field.
+    depth: usize,
     title: Option<String>,
     authors: Vec<String>,
     year: Option<String>,
@@ -391,37 +446,67 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
-    label: Option<String>,
+    /// Values of elements that are not read into a field, keyed `"endnote:{path}"`.
+    extras: HashMap<String, Vec<String>>,
+}
+
+/// A first-class field that an element path below `<record>` is read into.
+enum ReadField {
+    Title,
+    Author,
+    Year,
+    Journal,
+    Doi,
+    Pages,
+    Volume,
+    Number,
+    Abstract,
+    Isbn,
+}
+
+/// The field an element path below `<record>` is read into, if any. A rule written `[.., name]`
+/// claims every path ending in `name`, whatever its containers.
+fn read_field(path: &[&str]) -> Option<ReadField> {
+    Some(match path {
+        [.., "titles", "title"] => ReadField::Title,
+        [.., "contributors", "authors", "author"] => ReadField::Author,
+        [.., "dates", "year"] => ReadField::Year,
+        [.., "periodical", "full-title"] => ReadField::Journal,
+        [.., "electronic-resource-num"] => ReadField::Doi,
+        [.., "pages"] => ReadField::Pages,
+        [.., "volume"] => ReadField::Volume,
+        [.., "number"] => ReadField::Number,
+        [.., "abstract"] => ReadField::Abstract,
+        [.., "isbn"] => ReadField::Isbn,
+        _ => return None,
+    })
 }
 
 impl PendingRecord {
-    /// Map the current element path plus text content to the appropriate field.
-    ///
-    /// Paths are relative to the `<record>` element. For example, the title arrives as a path
-    /// `["record", "titles", "title"]` with the title text as content.
+    /// Store the text of a leaf element at `path` (relative to `<record>`) in its field, or in
+    /// `extras` if it has none. Empty text is ignored.
     fn set_field(&mut self, path: &[String], text: &str) {
         if text.is_empty() {
             return;
         }
-        match path
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [.., "titles", "title"] => self.title = Some(text.to_owned()),
-            [.., "contributors", "authors", "author"] => self.authors.push(text.to_owned()),
-            [.., "dates", "year"] => self.year = Some(text.to_owned()),
-            [.., "periodical", "full-title"] => self.journal = Some(text.to_owned()),
-            [.., "electronic-resource-num"] => self.doi = Some(text.to_owned()),
-            [.., "pages"] => self.pages = Some(text.to_owned()),
-            [.., "volume"] => self.volume = Some(text.to_owned()),
-            [.., "number"] => self.number = Some(text.to_owned()),
-            [.., "abstract"] => self.abstract_text = Some(text.to_owned()),
-            [.., "isbn"] => self.isbn = Some(text.to_owned()),
-            [.., "label"] => self.label = Some(text.to_owned()),
-            [.., "rec-number"] => self.rec_number = Some(text.to_owned()),
-            _ => {}
+        let names: Vec<&str> = path.iter().map(String::as_str).collect();
+        let value = Some(text.to_owned());
+        match read_field(&names) {
+            Some(ReadField::Title) => self.title = value,
+            Some(ReadField::Author) => self.authors.push(text.to_owned()),
+            Some(ReadField::Year) => self.year = value,
+            Some(ReadField::Journal) => self.journal = value,
+            Some(ReadField::Doi) => self.doi = value,
+            Some(ReadField::Pages) => self.pages = value,
+            Some(ReadField::Volume) => self.volume = value,
+            Some(ReadField::Number) => self.number = value,
+            Some(ReadField::Abstract) => self.abstract_text = value,
+            Some(ReadField::Isbn) => self.isbn = value,
+            None => push_extra(
+                &mut self.extras,
+                format!("endnote:{}", names.join("/")),
+                text,
+            ),
         }
     }
 
@@ -438,14 +523,6 @@ impl PendingRecord {
                 day: None,
             });
 
-        let mut extras = HashMap::new();
-        if let Some(label) = self.label {
-            extras.insert("label".into(), label);
-        }
-        if let Some(rn) = self.rec_number {
-            extras.insert("rec-number".into(), rn);
-        }
-
         Record {
             title: self.title,
             authors: self.authors,
@@ -457,7 +534,7 @@ impl PendingRecord {
             number: self.number,
             abstract_text: self.abstract_text,
             isbn: self.isbn,
-            extras,
+            extras: self.extras,
         }
     }
 }

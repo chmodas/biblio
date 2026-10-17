@@ -10,7 +10,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::bibtex::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::arb_date;
+use common::{arb_date, first_extra};
 
 // -- Core parsing --
 
@@ -55,7 +55,7 @@ fn single_entry() {
         Some("This is the abstract text.")
     );
     assert_eq!(r.isbn.as_deref(), Some("1234-5678"));
-    assert_eq!(r.extras.get("key").map(String::as_str), Some("doe2024"));
+    assert_eq!(first_extra(r, "bibtex:@key"), Some("doe2024"));
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn multiple_entries() {
         Some("CRISPR-Cas9 gene editing")
     );
     assert_eq!(
-        records[0].extras.get("key").map(String::as_str),
+        first_extra(&records[0], "bibtex:@key"),
         Some("frangoul2024")
     );
     assert_eq!(
@@ -253,6 +253,25 @@ fn date_unparseable_chunks() {
             day: None,
         })
     );
+}
+
+/// A `date` that is not a date, either blank or not starting with a year, gives no date.
+#[test]
+fn date_without_year_ignored() {
+    for date in ["", " ", "in press"] {
+        let input = format!("@article{{k, title = {{T}}, date = {{{date}}}}}\n");
+        let records = parse(&input).unwrap().records;
+        assert_eq!(records[0].date, None, "date = {{{date}}}");
+    }
+}
+
+/// A `year` that is not a number gives no date.
+#[test]
+fn year_not_a_number_ignored() {
+    let records = parse("@article{k, title = {T}, year = {in press}}\n")
+        .unwrap()
+        .records;
+    assert_eq!(records[0].date, None);
 }
 
 // -- Pages --
@@ -516,6 +535,54 @@ fn parenthesised_entry_skipped() {
 
 // -- Extras --
 
+/// Fields without a slot are kept under `bibtex:`, with the citation key and entry type as
+/// `bibtex:@key` and `bibtex:@type`.
+#[test]
+fn unread_fields_kept_in_extras() {
+    let input = "@book{k1, title = {T}, note = {A note}, Publisher = {Pub}, keywords = {a, b}}\n";
+    let records = parse(input).unwrap().records;
+    let extras = &records[0].extras;
+    assert_eq!(extras["bibtex:@key"], vec!["k1"]);
+    assert_eq!(extras["bibtex:@type"], vec!["book"]);
+    assert_eq!(extras["bibtex:note"], vec!["A note"]);
+    // Field names are lower-cased.
+    assert_eq!(extras["bibtex:publisher"], vec!["Pub"]);
+    assert_eq!(extras["bibtex:keywords"], vec!["a, b"]);
+    assert_eq!(extras.len(), 5);
+}
+
+/// An entry type the parser does not know keeps its name, and `@unknown` reads as "unknown".
+#[test]
+fn unknown_entry_types_keep_their_name() {
+    let input = "@dataset{a, title = {A}}\n@unknown{b, title = {B}}\n";
+    let records = parse(input).unwrap().records;
+    assert_eq!(first_extra(&records[0], "bibtex:@type"), Some("dataset"));
+    assert_eq!(first_extra(&records[1], "bibtex:@type"), Some("unknown"));
+}
+
+/// A month macro is expanded to the month's name.
+#[test]
+fn month_macro_kept_as_name() {
+    let records = parse("@article{k, title = {T}, month = jan}\n")
+        .unwrap()
+        .records;
+    assert_eq!(records[0].extras["bibtex:month"], vec!["January"]);
+}
+
+/// Fields a `crossref` child inherits from its parent are kept in the child's extras, along with
+/// the `crossref` itself.
+#[test]
+fn crossref_inheritance_kept_in_extras() {
+    let input = "\
+@book{parent, title = {P}, publisher = {Pub}}
+@incollection{child, title = {C}, crossref = {parent}}
+";
+    let records = parse(input).unwrap().records;
+    let child = &records[1];
+    assert_eq!(child.extras["bibtex:crossref"], vec!["parent"]);
+    assert_eq!(child.extras["bibtex:publisher"], vec!["Pub"]);
+}
+
 #[test]
 fn extras_citation_key() {
     let input = r"
@@ -524,10 +591,7 @@ fn extras_citation_key() {
 }
 ";
     let records = parse(input).unwrap().records;
-    assert_eq!(
-        records[0].extras.get("key").map(String::as_str),
-        Some("mykey2024")
-    );
+    assert_eq!(first_extra(&records[0], "bibtex:@key"), Some("mykey2024"));
 }
 
 // -- Error cases --
@@ -582,12 +646,272 @@ fn missing_title_kept_and_reported() {
 
 // -- Serialization --
 
+/// The entry type, key and extra fields are written back, so they read back unchanged.
+#[test]
+fn serialize_writes_type_key_and_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("bibtex:@type", "book")
+        .extra("bibtex:@key", "k1")
+        .extra("bibtex:note", "A note")
+        .build();
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.starts_with("@book{k1,\n"), "{output}");
+    assert!(output.contains("  note = {A note},\n"));
+    assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// Only `bibtex:` extras are written, and only the first value of each.
+#[test]
+fn serialize_writes_only_bibtex_extras_once() {
+    let record = Record::builder()
+        .title("T")
+        .extra("bibtex:note", "first")
+        .extra("bibtex:note", "second")
+        .extra("ris:KW", "cats")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains("note = {first}"));
+    assert!(!output.contains("second"));
+    assert!(!output.contains("cats"));
+}
+
+/// Extras that are not valid field names, name a field the parser reads, or cannot be resolved,
+/// are not written; an invalid type or key falls back to the default.
+#[test]
+fn serialize_skips_unwritable_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("bibtex:@type", "a b")
+        .extra("bibtex:@key", "has space")
+        .extra("bibtex:Bad Name", "x")
+        .extra("bibtex:xdata", "x")
+        .extra("bibtex:journal", "would become the journal")
+        .build();
+    assert_eq!(
+        serialize(&[record]),
+        "@article{unknown,\n  title = {T},\n}\n"
+    );
+
+    let comment = Record::builder()
+        .extra("bibtex:@type", "comment")
+        .extra("bibtex:@key", "self")
+        .extra("bibtex:crossref", "self")
+        .build();
+    assert_eq!(serialize(&[comment]), "@article{self,\n}\n");
+}
+
+/// A month from the date is written instead of a `bibtex:month` extra, so the field appears once.
+#[test]
+fn date_month_wins_over_month_extra() {
+    let record = Record::builder()
+        .title("T")
+        .date(PublicationDate {
+            year: 2024,
+            month: Some(3),
+            day: None,
+        })
+        .extra("bibtex:month", "January")
+        .build();
+    let output = serialize(&[record]);
+    assert_eq!(output.matches("month =").count(), 1, "{output}");
+    assert!(output.contains("month = {3}"));
+}
+
+/// A `crossref` that would close a cycle is not written, whether the cycle runs through another
+/// entry or through the entry's own `ids` alias, so the output can always be read back. A
+/// `crossref` that only leads into other entries is kept.
+#[test]
+fn crossref_cycles_not_written() {
+    let entry = |key: &str, crossref: &str| {
+        Record::builder()
+            .title(key)
+            .extra("bibtex:@key", key)
+            .extra("bibtex:crossref", crossref)
+            .build()
+    };
+    let pair = serialize(&[entry("a", "b"), entry("b", "a")]);
+    assert!(!pair.contains("crossref"), "{pair}");
+    assert_eq!(parse(&pair).unwrap().records.len(), 2);
+
+    let alias = Record::builder()
+        .title("A")
+        .extra("bibtex:@key", "a")
+        .extra("bibtex:ids", "x, b")
+        .extra("bibtex:crossref", "b")
+        .build();
+    let output = serialize(&[alias]);
+    assert!(!output.contains("crossref"), "{output}");
+    assert_eq!(parse(&output).unwrap().records.len(), 1);
+
+    let parent = Record::builder()
+        .title("P")
+        .extra("bibtex:@key", "p")
+        .build();
+    let chain = serialize(&[entry("c", "p"), parent]);
+    assert!(chain.contains("crossref = {p}"), "{chain}");
+}
+
+/// An extra with no values writes nothing.
+#[test]
+fn serialize_skips_extras_without_values() {
+    let mut record = Record::builder().title("T").build();
+    record.extras.insert("bibtex:note".to_owned(), Vec::new());
+    assert_eq!(
+        serialize(&[record]),
+        "@article{unknown,\n  title = {T},\n}\n"
+    );
+}
+
+/// An entry whose `crossref` leads into a cycle it is not part of keeps its `crossref`; only the
+/// entries on the cycle lose theirs.
+#[test]
+fn crossref_into_a_cycle_kept() {
+    let entry = |key: &str, crossref: &str| {
+        Record::builder()
+            .title(key)
+            .extra("bibtex:@key", key)
+            .extra("bibtex:crossref", crossref)
+            .build()
+    };
+    let output = serialize(&[entry("c", "a"), entry("a", "b"), entry("b", "a")]);
+    let records = parse(&output).unwrap().records;
+    let crossrefs: Vec<_> = records
+        .iter()
+        .map(|r| first_extra(r, "bibtex:crossref"))
+        .collect();
+    assert_eq!(crossrefs, [Some("a"), None, None], "{output}");
+}
+
+/// A field name with an uppercase letter is not written, even when it is otherwise valid, because
+/// the parser lower-cases names and it would read back under a different key.
+#[test]
+fn serialize_skips_uppercase_field_names() {
+    let record = Record::builder()
+        .title("T")
+        .extra("bibtex:Note", "x")
+        .build();
+    assert_eq!(
+        serialize(&[record]),
+        "@article{unknown,\n  title = {T},\n}\n"
+    );
+}
+
+/// A `bibtex:month` extra is written when the date has no month to write instead, or there is no
+/// date at all.
+#[test]
+fn month_extra_written_without_date_month() {
+    let year_only = Record::builder()
+        .title("T")
+        .date(PublicationDate {
+            year: 2024,
+            month: None,
+            day: None,
+        })
+        .extra("bibtex:month", "March")
+        .build();
+    assert!(serialize(&[year_only]).contains("month = {March}"));
+
+    let no_date = Record::builder()
+        .title("T")
+        .extra("bibtex:month", "March")
+        .build();
+    assert!(serialize(&[no_date]).contains("month = {March}"));
+}
+
+/// The special entry types `@comment`, `@string` and `@preamble`, in any case, are never written as
+/// the entry type, because the entry would vanish or fail to parse.
+#[test]
+fn special_entry_types_fall_back_to_article() {
+    for entry_type in ["comment", "string", "preamble", "Comment", "PREAMBLE"] {
+        let record = Record::builder()
+            .title("T")
+            .extra("bibtex:@type", entry_type)
+            .build();
+        let output = serialize(&[record]);
+        assert!(output.starts_with("@article{"), "{entry_type}: {output}");
+    }
+}
+
+/// A field name starting with a character the parser does not accept at the start of a name is not
+/// written; the same character later in the name is fine.
+#[test]
+fn field_names_with_invalid_first_character_skipped() {
+    for first in [':', '<', '-', '>'] {
+        let record = Record::builder()
+            .title("T")
+            .extra(format!("bibtex:{first}x"), "skipped")
+            .extra(format!("bibtex:x{first}y"), "kept")
+            .build();
+        let output = serialize(&[record]);
+        assert!(!output.contains("skipped"), "{first}: {output}");
+        assert!(
+            output.contains(&format!("x{first}y = {{kept}}")),
+            "{first}: {output}"
+        );
+    }
+}
+
+/// Values are escaped so that braces, backslashes and dollar signs read back unchanged, except
+/// that `$` is left alone in verbatim fields such as `url`.
+#[test]
+fn serialize_escapes_values() {
+    let record = Record::builder()
+        .title("A {braced} title")
+        .extra("bibtex:@key", "k")
+        .extra("bibtex:@type", "article")
+        .extra("bibtex:note", "costs $5, ends with \\")
+        .extra("bibtex:url", "https://example.org/$id")
+        .build();
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(
+        output.contains("url = {https://example.org/$id}"),
+        "{output}"
+    );
+    assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// Converting `BibTeX` to `RIS` writes no `BibTeX` key or fields into the `RIS`, so it reads back
+/// cleanly. Regression test: the citation key used to be written as a `key  -` line, which read
+/// back as part of the previous field.
+#[test]
+fn bibtex_to_ris_writes_no_foreign_tags() {
+    let input = "\
+@article{doe2024,
+  title  = {An interesting finding},
+  author = {Doe, Jane and Smith, John},
+  year   = {2024},
+  journal = {Nature},
+  note   = {A note},
+}
+";
+    let records = parse(input).unwrap().records;
+    let ris_output = biblio::ris::serialize(&records);
+    assert!(!ris_output.contains("doe2024"), "{ris_output}");
+    assert!(!ris_output.contains("A note"));
+    let reparsed = biblio::ris::parse(&ris_output).unwrap();
+    assert_eq!(reparsed.diagnostics, Vec::<Diagnostic>::new());
+    assert_eq!(reparsed.records[0].title, records[0].title);
+    assert_eq!(reparsed.records[0].journal, records[0].journal);
+}
+
+/// Several entries with distinct keys are written and read back whole, keys included.
 #[test]
 fn serialize_multiple_entries() {
-    let a = Record::builder().title("First").extra("key", "a").build();
-    let b = Record::builder().title("Second").extra("key", "b").build();
+    let a = Record::builder()
+        .title("First")
+        .extra("bibtex:@key", "a")
+        .build();
+    let b = Record::builder()
+        .title("Second")
+        .extra("bibtex:@key", "b")
+        .build();
     let output = serialize(&[a, b]);
-    let reparsed = parse(&output).unwrap().records;
+    let parsed = parse(&output).unwrap();
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+    let reparsed = parsed.records;
+    assert_eq!(first_extra(&reparsed[0], "bibtex:@key"), Some("a"));
+    assert_eq!(first_extra(&reparsed[1], "bibtex:@key"), Some("b"));
     assert_eq!(reparsed.len(), 2);
     assert_eq!(reparsed[0].title.as_deref(), Some("First"));
     assert_eq!(reparsed[1].title.as_deref(), Some("Second"));
@@ -602,7 +926,7 @@ fn serialize_with_month() {
             month: Some(3),
             day: None,
         })
-        .extra("key", "test")
+        .extra("bibtex:@key", "test")
         .build();
     let output = serialize(&[record]);
     assert!(output.contains("year = {2024}"));
@@ -613,7 +937,7 @@ fn serialize_with_month() {
 fn serialize_skips_none_fields() {
     let record = Record::builder()
         .title("Minimal")
-        .extra("key", "min")
+        .extra("bibtex:@key", "min")
         .build();
     let output = serialize(&[record]);
     assert!(output.contains("title = {Minimal}"));
@@ -670,36 +994,98 @@ fn date_display() {
 
 // -- Proptest helpers --
 
-fn arb_bibtex_record() -> impl Strategy<Value = Record> {
-    // BibTeX-safe text: no braces which would break the format.
-    // No braces, no hyphens (biblatex converts -- to en-dash), no backslash,
-    // no tilde (biblatex converts ~ to non-breaking space).
-    let bib_safe = "[A-Za-z0-9 .,;:!?'()\\[\\]/<>@#%^*+=_]";
-    let arb_bib_text = move |max_len: usize| {
-        proptest::string::string_regex(&format!("{bib_safe}{{1,{max_len}}}"))
-            .unwrap()
-            .prop_map(|s| {
-                // Collapse multiple spaces – biblatex normalises whitespace.
-                let mut prev_space = false;
-                let collapsed: String = s
-                    .chars()
-                    .filter(|&c| {
-                        if c == ' ' {
-                            if prev_space {
-                                return false;
-                            }
-                            prev_space = true;
-                        } else {
-                            prev_space = false;
-                        }
-                        true
-                    })
-                    .collect();
-                collapsed.trim().to_owned()
-            })
-            .prop_filter("must not be empty after trim", |s| !s.is_empty())
-    };
+/// Fields the generator never uses as extras: the fields the `BibTeX` parser reads (a copy of its
+/// list), `xdata` (consumed while resolving), and `crossref`, `ids` and `set`, which refer to other
+/// entries.
+const BIBTEX_RESERVED_FIELDS: [&str; 17] = [
+    "title",
+    "author",
+    "date",
+    "year",
+    "journaltitle",
+    "journal",
+    "doi",
+    "pages",
+    "volume",
+    "number",
+    "abstract",
+    "isbn",
+    "issn",
+    "xdata",
+    "crossref",
+    "ids",
+    "set",
+];
 
+/// Entry types that do not read back as themselves: aliases that the parser renames, `unknown`,
+/// and the special entries `@comment`, `@string`, `@preamble`, `@xdata` and `@set`.
+const UNSTABLE_ENTRY_TYPES: [&str; 9] = [
+    "conference",
+    "electronic",
+    "www",
+    "unknown",
+    "comment",
+    "string",
+    "preamble",
+    "xdata",
+    "set",
+];
+
+/// An entry type that reads back as itself: a common one, or any lower-case name that is not
+/// special.
+fn arb_entry_type() -> impl Strategy<Value = String> {
+    prop_oneof![
+        proptest::sample::select(vec!["article", "book", "inproceedings", "misc", "dataset"])
+            .prop_map(str::to_owned),
+        "[a-z]{3,10}".prop_filter("entry type must read back unchanged", |name| {
+            !UNSTABLE_ENTRY_TYPES.contains(&name.as_str())
+        }),
+    ]
+}
+
+/// Text that reads back unchanged from a `BibTeX` field: no braces (which would break the format),
+/// hyphens (`--` becomes an en dash), backslashes or tildes (`~` becomes a no-break space), with
+/// single spaces only and no surrounding whitespace, because the parser collapses whitespace.
+fn arb_bib_text(max_len: usize) -> impl Strategy<Value = String> {
+    let bib_safe = "[A-Za-z0-9 .,;:!?'()\\[\\]/<>@#%^*+=_]";
+    proptest::string::string_regex(&format!("{bib_safe}{{1,{max_len}}}"))
+        .unwrap()
+        .prop_map(|s| {
+            // Collapse multiple spaces – biblatex normalises whitespace.
+            let mut prev_space = false;
+            let collapsed: String = s
+                .chars()
+                .filter(|&c| {
+                    if c == ' ' {
+                        if prev_space {
+                            return false;
+                        }
+                        prev_space = true;
+                    } else {
+                        prev_space = false;
+                    }
+                    true
+                })
+                .collect();
+            collapsed.trim().to_owned()
+        })
+        .prop_filter("must not be empty after trim", |s| !s.is_empty())
+}
+
+/// Up to four fields the parser does not read, each with one value (a field appears once per
+/// entry).
+fn arb_bibtex_unread_fields() -> impl Strategy<Value = HashMap<String, String>> {
+    proptest::collection::hash_map(
+        "[a-z]{2,10}".prop_filter("field must not be read or special", |name| {
+            // `month` would give way to a date's month when written.
+            !BIBTEX_RESERVED_FIELDS.contains(&name.as_str()) && name != "month"
+        }),
+        arb_bib_text(40),
+        0..=4,
+    )
+}
+
+fn arb_bibtex_record() -> impl Strategy<Value = Record> {
     (
         proptest::option::of(arb_bib_text(80)),
         // BibTeX-specific author: no hyphens (biblatex converts -- to en-dash),
@@ -747,6 +1133,8 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
             "[a-z]{1,10}[0-9]{4}", // citation key
+            arb_entry_type(),
+            arb_bibtex_unread_fields(),
         ),
     )
         .prop_map(
@@ -760,10 +1148,14 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, key),
+                (isbn, key, entry_type, unread),
             )| {
-                let mut extras = HashMap::new();
-                extras.insert("key".into(), key);
+                let mut extras: HashMap<String, Vec<String>> = unread
+                    .into_iter()
+                    .map(|(name, value)| (format!("bibtex:{name}"), vec![value]))
+                    .collect();
+                extras.insert("bibtex:@key".to_owned(), vec![key]);
+                extras.insert("bibtex:@type".to_owned(), vec![entry_type]);
                 {
                     let mut record = Record::default();
                     record.title = title;
@@ -975,4 +1367,74 @@ fn byte_order_mark_does_not_change_result(
     #[strategy(arb_input_without_byte_order_mark())] input: String,
 ) {
     prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
+}
+
+// -- Extras properties --
+
+/// Keys of the other formats, which `BibTeX` serialisation must never write.
+const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "endnote:keywords/keyword"];
+
+/// An extra naming a field the parser reads (or `xdata`, which is consumed when resolving) is never
+/// written, so it cannot leak into a field.
+#[proptest]
+fn read_fields_never_written_from_extras(
+    #[strategy(proptest::sample::select(BIBTEX_RESERVED_FIELDS[..14].to_vec()))] name: &'static str,
+    #[strategy(arb_bibtex_record())] record: Record,
+) {
+    let mut with_read_field = record.clone();
+    with_read_field
+        .extras
+        .insert(format!("bibtex:{name}"), vec!["leaked value".to_owned()]);
+    prop_assert_eq!(serialize(&[with_read_field]), serialize(&[record]));
+}
+
+/// Extras of other formats are kept on the record but never written as `BibTeX` fields.
+#[proptest]
+fn foreign_extras_not_written(
+    #[strategy(arb_bibtex_record())] record: Record,
+    #[strategy("[A-Za-z0-9 ]{1,30}")] value: String,
+) {
+    let mut with_foreign = record.clone();
+    for key in FOREIGN_KEYS {
+        with_foreign
+            .extras
+            .insert(key.to_owned(), vec![value.clone()]);
+    }
+    prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// Pieces of a field value in `BibTeX` source: words, escaped special characters, groups, inline
+/// maths and dashes, which the parser rewrites.
+fn arb_value_token() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => "[A-Za-z0-9]{1,8}",
+        1 => proptest::sample::select(vec!["\\{", "\\}", "\\$", "\\%", "\\&", "--"])
+            .prop_map(str::to_owned),
+        1 => "[A-Za-z]{1,6}".prop_map(|word| format!("{{{word}}}")),
+        1 => "[A-Za-z]{1,6}".prop_map(|word| format!("${word}$")),
+    ]
+}
+
+/// Entries read from source with arbitrary extra fields, whose values the parser rewrites, come
+/// back unchanged when written and read again.
+#[proptest]
+fn records_stable_through_serialize(
+    #[strategy(proptest::collection::hash_map(
+        "[a-z]{2,10}".prop_filter("field must not be read or special", |name| {
+            !BIBTEX_RESERVED_FIELDS.contains(&name.as_str()) && name != "month"
+        }),
+        proptest::collection::vec(arb_value_token(), 1..6).prop_map(|tokens| tokens.join(" ")),
+        0..5,
+    ))]
+    fields: HashMap<String, String>,
+) {
+    let mut input = String::from("@misc{k,\n  title = {A title},\n");
+    for (name, value) in &fields {
+        writeln!(input, "  {name} = {{{value}}},").unwrap();
+    }
+    input.push_str("}\n");
+    let first = parse(&input).unwrap();
+    prop_assert_eq!(&first.diagnostics, &Vec::<Diagnostic>::new());
+    let second = parse(&serialize(&first.records)).unwrap().records;
+    prop_assert_eq!(second, first.records);
 }

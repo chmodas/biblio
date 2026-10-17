@@ -58,7 +58,7 @@ let rec = Record::builder()
 
 `Record`, `Parsed`, `Diagnostic` and `Error` are `#[non_exhaustive]`, so fields and variants can be added without breaking your code: build records with the builder, and give a `match` on `Diagnostic` or `Error` a wildcard arm.
 
-The title is optional, because some records have none. A few format-specific values (PMID, PMCID, citation key, etc.) land in `extras: HashMap<String, String>`; fields that `biblio` does not read yet are not kept.
+The title is optional, because some records have none. Every field without a slot of its own lands in `extras: HashMap<String, Vec<String>>`, keyed by format and tag (`"ris:KW"`, `"nbib:PMID"`, `"bibtex:note"`, `"endnote:keywords/keyword"`, …) with its values in order, so fields without a slot are no longer dropped. Each serialiser writes back only the extras of its own format: converting BibTeX to RIS keeps the BibTeX-only fields on the record but does not write them into the RIS.
 
 ## Errors and diagnostics
 
