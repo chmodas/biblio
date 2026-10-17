@@ -12,8 +12,8 @@ use winnow::Parser;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings, parsed,
-    report_missing_title, strip_byte_order_mark,
+    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
+    own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -27,6 +27,14 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// - [`Diagnostic::IgnoredLine`]: a line outside any record, or a non-tag line directly after `TY`.
 ///
 /// A leading byte-order mark is ignored.
+///
+/// # Extras
+///
+/// Every tag without a field is kept in [`Record::extras`] as `"ris:{tag}"`, one value per
+/// occurrence, with its continuation lines joined; the record type from `TY` is kept as `"ris:TY"`.
+/// Tags that are read but lose to another are dropped: `T1` when `TI` is present, `Y1` and `PY`
+/// (the last one wins), all but the last `SN`, and journal tags that lose to a preferred one. So
+/// are dates in `PY` or `Y1` that cannot be read.
 ///
 /// # Errors
 ///
@@ -71,10 +79,12 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
                         });
                         records.push(open.finish(&mut diagnostics));
                     }
-                    pending = Some(PendingRecord {
+                    let mut open = PendingRecord {
                         line_start: line_number,
                         ..PendingRecord::default()
-                    });
+                    };
+                    push_extra(&mut open.extras, "ris:TY".to_owned(), value);
+                    pending = Some(open);
                 }
                 // ER finalizes the current record.
                 "ER" => match pending.take() {
@@ -109,9 +119,10 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 
 /// Serialize [`Record`]s to `RIS` format.
 ///
-/// Each record is emitted as type `JOUR` (journal article). Pages are split into `SP`/`EP` tags on
-/// hyphens or en-dashes. Entries in `extras` are written as additional tags with their key as the
-/// tag name.
+/// The record type comes from `extras["ris:TY"]`, falling back to `JOUR` (journal article). Pages
+/// are split into `SP`/`EP` tags on hyphens or en-dashes. Other `ris:` extras are written as tags
+/// after the fields, sorted by tag; keys that are not two-character tags, and tags the parser reads
+/// into fields, are skipped. Extras of other formats are not written.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -121,7 +132,12 @@ pub fn serialize(records: &[Record]) -> String {
             buf.push('\n');
         }
 
-        write_tag(&mut buf, "TY", "JOUR");
+        let record_type = record
+            .extras
+            .get("ris:TY")
+            .and_then(|values| values.first())
+            .map_or("JOUR", String::as_str);
+        write_tag(&mut buf, "TY", record_type);
         if let Some(title) = &record.title {
             write_tag(&mut buf, "TI", title);
         }
@@ -169,11 +185,13 @@ pub fn serialize(records: &[Record]) -> String {
             write_tag(&mut buf, "SN", isbn);
         }
 
-        // Extras – sort keys for deterministic output.
-        let mut extras_sorted: Vec<_> = record.extras.iter().collect();
-        extras_sorted.sort_by_key(|(k, _)| k.as_str());
-        for (key, value) in extras_sorted {
-            write_tag(&mut buf, key, value);
+        // Extras of this format, sorted by tag for deterministic output.
+        for (tag, values) in own_extras(&record.extras, "ris") {
+            if is_tag_shape(tag) && !is_read_tag(tag) {
+                for value in values {
+                    write_tag(&mut buf, tag, value);
+                }
+            }
         }
 
         write_tag(&mut buf, "ER", "");
@@ -242,6 +260,38 @@ fn tag_line<'a>(input: &mut &'a str) -> winnow::ModalResult<(&'a str, &'a str)> 
 /// `JO`, then the abbreviations (`JA`, `J2`, and the user abbreviation `J1`).
 const JOURNAL_TAGS: [&str; 6] = ["JF", "T2", "JO", "JA", "J2", "J1"];
 
+/// Whether the parser reads `tag` itself, into a field or as record structure, rather than keeping
+/// it in `extras`. The serialiser never writes such a tag from `extras`.
+fn is_read_tag(tag: &str) -> bool {
+    journal_index(tag).is_some()
+        || matches!(
+            tag,
+            "TY" | "ER"
+                | "TI"
+                | "T1"
+                | "AU"
+                | "A1"
+                | "PY"
+                | "Y1"
+                | "DO"
+                | "SP"
+                | "EP"
+                | "VL"
+                | "IS"
+                | "AB"
+                | "N2"
+                | "SN"
+        )
+}
+
+/// Whether `tag` has the shape of a `RIS` tag: two uppercase ASCII letters or digits.
+fn is_tag_shape(tag: &str) -> bool {
+    tag.len() == 2
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 /// Return the position of `tag` in [`JOURNAL_TAGS`], or `None` if it does not carry a journal.
 fn journal_index(tag: &str) -> Option<usize> {
     JOURNAL_TAGS.iter().position(|t| *t == tag)
@@ -266,7 +316,8 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
-    extras: HashMap<String, String>,
+    /// Values of tags that are not read into a field, keyed `"ris:{tag}"`.
+    extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
 }
 
@@ -287,10 +338,8 @@ impl PendingRecord {
                 "IS" => self.number = Some(value.to_owned()),
                 "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
                 "SN" => self.isbn = Some(value.to_owned()),
-                "ID" => {
-                    self.extras.insert(tag.to_owned(), value.to_owned());
-                }
-                _ => {}
+                // Keep this list in step with `is_read_tag`.
+                _ => push_extra(&mut self.extras, format!("ris:{tag}"), value),
             }
         }
         self.last_tag = Some(tag.to_owned());
@@ -311,7 +360,11 @@ impl PendingRecord {
             "T1" => append_to_opt(&mut self.t1_title, text),
             "AB" | "N2" => append_to_opt(&mut self.abstract_text, text),
             "AU" | "A1" => append_to_last(&mut self.authors, text),
-            _ => {}
+            _ => {
+                if let Some(values) = self.extras.get_mut(&format!("ris:{tag}")) {
+                    append_to_last(values, text);
+                }
+            }
         }
         true
     }

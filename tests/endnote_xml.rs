@@ -2,12 +2,13 @@ mod common;
 
 use proptest::prelude::*;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use test_strategy::proptest;
 
 use biblio::endnote_xml::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_volume};
+use common::{arb_author, arb_date, arb_pages, arb_volume, first_extra};
 
 // -- Core parsing --
 
@@ -60,8 +61,10 @@ fn single_record() {
         Some("This is the abstract text.")
     );
     assert_eq!(r.isbn.as_deref(), Some("1234-5678"));
-    assert_eq!(r.extras.get("label").map(String::as_str), Some("ref001"));
-    assert_eq!(r.extras.get("rec-number").map(String::as_str), Some("42"));
+    assert_eq!(first_extra(r, "endnote:label"), Some("ref001"));
+    assert_eq!(first_extra(r, "endnote:rec-number"), Some("42"));
+    // The whitespace inside containers such as <authors> is not a value.
+    assert_eq!(r.extras.len(), 2, "{:?}", r.extras);
 }
 
 #[test]
@@ -265,6 +268,28 @@ fn date_year_only() {
 
 // -- Extras --
 
+/// Elements without a field are kept under `endnote:` with their path below `<record>`, repeated
+/// elements keeping every value in order.
+#[test]
+fn unread_elements_kept_by_path() {
+    let input = r#"<xml><records><record>
+  <ref-type name="Journal Article">17</ref-type>
+  <titles><title>T</title><secondary-title>Nature</secondary-title></titles>
+  <keywords><keyword>cats</keyword><keyword>dogs</keyword></keywords>
+  <urls><related-urls><url>https://example.org</url></related-urls></urls>
+</record></records></xml>"#;
+    let records = parse(input).unwrap().records;
+    let extras = &records[0].extras;
+    assert_eq!(extras["endnote:ref-type"], vec!["17"]);
+    assert_eq!(extras["endnote:titles/secondary-title"], vec!["Nature"]);
+    assert_eq!(extras["endnote:keywords/keyword"], vec!["cats", "dogs"]);
+    assert_eq!(
+        extras["endnote:urls/related-urls/url"],
+        vec!["https://example.org"]
+    );
+    assert_eq!(extras.len(), 4);
+}
+
 #[test]
 fn extras_label_and_rec_number() {
     let input = r"<xml><records>
@@ -276,14 +301,8 @@ fn extras_label_and_rec_number() {
 </records></xml>";
 
     let records = parse(input).unwrap().records;
-    assert_eq!(
-        records[0].extras.get("label").map(String::as_str),
-        Some("myref")
-    );
-    assert_eq!(
-        records[0].extras.get("rec-number").map(String::as_str),
-        Some("99")
-    );
+    assert_eq!(first_extra(&records[0], "endnote:label"), Some("myref"));
+    assert_eq!(first_extra(&records[0], "endnote:rec-number"), Some("99"));
 }
 
 #[test]
@@ -296,11 +315,8 @@ fn extras_label_only() {
 </records></xml>";
 
     let records = parse(input).unwrap().records;
-    assert_eq!(
-        records[0].extras.get("label").map(String::as_str),
-        Some("onlylabel")
-    );
-    assert_eq!(records[0].extras.get("rec-number"), None);
+    assert_eq!(first_extra(&records[0], "endnote:label"), Some("onlylabel"));
+    assert_eq!(first_extra(&records[0], "endnote:rec-number"), None);
 }
 
 // -- Error cases --
@@ -436,6 +452,73 @@ fn missing_title_kept_and_reported() {
 
 // -- Serialization --
 
+/// A container whose only children are self-closing holds no value, even with indentation inside
+/// it. Regression test from code review.
+#[test]
+fn container_of_empty_elements_has_no_value() {
+    let input = "\
+<xml><records>
+<record>
+  <urls>
+    <related-urls/>
+  </urls>
+</record>
+</records></xml>";
+    let records = parse(input).unwrap().records;
+    assert!(
+        !records[0].extras.contains_key("endnote:urls"),
+        "{:?}",
+        records[0].extras
+    );
+}
+
+/// Extras of a `<record>` nested inside another are keyed by their path below the inner record.
+#[test]
+fn nested_record_extras_relative_to_inner_record() {
+    let input = "<xml><records><record><record><notes>N</notes></record></record></records></xml>";
+    let records = parse(input).unwrap().records;
+    assert_eq!(records[0].extras["endnote:notes"], vec!["N"]);
+}
+
+/// Extras are written as nested elements, one per value, and read back unchanged; extras of other
+/// formats are not written.
+#[test]
+fn serialize_writes_extras_as_nested_elements() {
+    let record = Record::builder()
+        .title("T")
+        .extra("endnote:keywords/keyword", "cats")
+        .extra("endnote:keywords/keyword", "dogs")
+        .extra("endnote:ref-type", "17")
+        .extra("ris:KW", "not written")
+        .build();
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("<keywords><keyword>cats</keyword><keyword>dogs</keyword></keywords>"));
+    assert!(!output.contains("not written"));
+    let mut expected = record;
+    expected.extras.remove("ris:KW");
+    assert_eq!(parse(&output).unwrap().records, vec![expected]);
+}
+
+/// Extras whose path cannot be written, or that the parser would read into a field, are skipped,
+/// and so are extras with only empty values.
+#[test]
+fn serialize_skips_unwritable_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("endnote:a//b", "x")
+        .extra("endnote:1x", "x")
+        .extra("endnote:x/record", "x")
+        .extra("endnote:style", "x")
+        .extra("endnote:foo/pages", "would become the pages")
+        .extra("endnote:note", "")
+        .build();
+    let output = serialize(&[record]);
+    assert!(
+        output.ends_with("<record><titles><title>T</title></titles></record></records></xml>"),
+        "{output}"
+    );
+}
+
 #[test]
 fn serialize_multiple_records() {
     let a = Record::builder().title("First").build();
@@ -458,6 +541,35 @@ fn serialize_skips_none_fields() {
 }
 
 // -- Proptest helpers --
+
+/// The leaf element names that the `EndNote XML` parser reads into fields. Some are read only under
+/// a particular container (`title` under `titles`, for instance), but the generator avoids them
+/// everywhere, which is simpler and only slightly over-cautious.
+const ENDNOTE_READ_LEAVES: [&str; 10] = [
+    "title",
+    "author",
+    "year",
+    "full-title",
+    "electronic-resource-num",
+    "pages",
+    "volume",
+    "number",
+    "abstract",
+    "isbn",
+];
+
+/// An element path below `<record>` that the parser does not read: one to three names, none of them
+/// `record` or `style`, and ending in a name that is not a read leaf.
+fn arb_unread_path() -> impl Strategy<Value = String> {
+    proptest::collection::vec("[a-z][a-z-]{1,8}", 1..=3).prop_filter_map(
+        "path must not be read",
+        |segments| {
+            let usable = segments.iter().all(|s| s != "record" && s != "style")
+                && !ENDNOTE_READ_LEAVES.contains(&segments.last()?.as_str());
+            usable.then(|| segments.join("/"))
+        },
+    )
+}
 
 fn arb_endnote_record() -> impl Strategy<Value = Record> {
     // XML-safe text: no < > & which would break XML structure
@@ -488,8 +600,11 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
         proptest::option::of(arb_xml_text(200)), // abstract
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"), // ISSN
-            proptest::option::of("[A-Za-z0-9]{1,10}"),       // label
-            proptest::option::of("[0-9]{1,6}"),              // rec-number
+            proptest::collection::hash_map(
+                arb_unread_path(),
+                proptest::collection::vec(arb_xml_text(40), 1..=3),
+                0..=4,
+            ),
         ),
     )
         .prop_map(
@@ -503,15 +618,12 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, label, rec_number),
+                (isbn, unread),
             )| {
-                let mut extras = HashMap::new();
-                if let Some(label) = label {
-                    extras.insert("label".into(), label);
-                }
-                if let Some(rn) = rec_number {
-                    extras.insert("rec-number".into(), rn);
-                }
+                let extras: HashMap<String, Vec<String>> = unread
+                    .into_iter()
+                    .map(|(path, values)| (format!("endnote:{path}"), values))
+                    .collect();
                 {
                     let mut record = Record::default();
                     record.title = title;
@@ -651,4 +763,90 @@ fn byte_order_mark_does_not_change_result(
     #[strategy(arb_input_without_byte_order_mark())] input: String,
 ) {
     prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
+}
+
+// -- Extras properties --
+
+/// Keys of the other formats, which `EndNote XML` serialisation must never write.
+const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "bibtex:note"];
+
+/// The element paths the parser reads into fields, in the form it reads them.
+const ENDNOTE_READ_PATHS: [&str; 10] = [
+    "titles/title",
+    "contributors/authors/author",
+    "dates/year",
+    "periodical/full-title",
+    "electronic-resource-num",
+    "pages",
+    "volume",
+    "number",
+    "abstract",
+    "isbn",
+];
+
+/// An extra whose path the parser reads into a field is never written, so it cannot leak into the
+/// field.
+#[proptest]
+fn read_paths_never_written_from_extras(
+    #[strategy(proptest::sample::select(ENDNOTE_READ_PATHS.to_vec()))] path: &'static str,
+    #[strategy(arb_endnote_record())] record: Record,
+) {
+    let mut with_read_path = record.clone();
+    with_read_path
+        .extras
+        .insert(format!("endnote:{path}"), vec!["leaked value".to_owned()]);
+    prop_assert_eq!(serialize(&[with_read_path]), serialize(&[record]));
+}
+
+/// Extras of other formats are kept on the record but never written as elements.
+#[proptest]
+fn foreign_extras_not_written(
+    #[strategy(arb_endnote_record())] record: Record,
+    #[strategy("[A-Za-z0-9 ]{1,30}")] value: String,
+) {
+    let mut with_foreign = record.clone();
+    for key in FOREIGN_KEYS {
+        with_foreign
+            .extras
+            .insert(key.to_owned(), vec![value.clone()]);
+    }
+    prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// Records read from indented XML with arbitrary unread elements come back unchanged when written
+/// and read again; the indentation inside containers never becomes a value.
+#[proptest]
+fn records_stable_through_serialize(
+    #[strategy(proptest::collection::vec(
+        (arb_unread_path(), "[A-Za-z0-9][A-Za-z0-9 .,]{0,20}"),
+        0..6
+    ))]
+    elements: Vec<(String, String)>,
+) {
+    let mut input = String::from(
+        "<xml>\n  <records>\n    <record>\n      <titles>\n        <title>A title</title>\n",
+    );
+    input.push_str("      </titles>\n");
+    for (path, value) in &elements {
+        let segments: Vec<&str> = path.split('/').collect();
+        let (leaf, containers) = segments.split_last().unwrap();
+        for (depth, container) in containers.iter().enumerate() {
+            writeln!(input, "{}<{container}>", "  ".repeat(depth + 3)).unwrap();
+        }
+        writeln!(
+            input,
+            "{}<{leaf}>{value}</{leaf}>",
+            "  ".repeat(containers.len() + 3)
+        )
+        .unwrap();
+        for (depth, container) in containers.iter().enumerate().rev() {
+            writeln!(input, "{}</{container}>", "  ".repeat(depth + 3)).unwrap();
+        }
+    }
+    input.push_str("    </record>\n  </records>\n</xml>\n");
+    let first = parse(&input).unwrap().records;
+    let extra_values: usize = first[0].extras.values().map(Vec::len).sum();
+    prop_assert_eq!(extra_values, elements.len());
+    let second = parse(&serialize(&first)).unwrap().records;
+    prop_assert_eq!(second, first);
 }

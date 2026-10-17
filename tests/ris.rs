@@ -10,7 +10,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::ris::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume};
+use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume, first_extra};
 
 // -- Core parsing --
 
@@ -58,7 +58,7 @@ ER  -
         Some("This is the abstract text.")
     );
     assert_eq!(r.isbn.as_deref(), Some("1234-5678"));
-    assert_eq!(r.extras.get("ID").map(String::as_str), Some("ref001"));
+    assert_eq!(first_extra(r, "ris:ID"), Some("ref001"));
 }
 
 #[test]
@@ -145,18 +145,37 @@ fn windows_line_endings() {
     assert_eq!(records[0].authors, vec!["Doe, Jane"]);
 }
 
+/// Tags without a field are kept in `extras` under `ris:`, with repeated tags keeping every value
+/// in order, and the record type is kept as `ris:TY`.
 #[test]
-fn unknown_tags_ignored() {
+fn unknown_tags_kept_in_extras() {
     let input = "\
-TY  - JOUR
+TY  - BOOK
 TI  - A test title
 KW  - keyword one
+KW  - keyword two
 N1  - some note
 ER  -
 ";
     let records = parse(input).unwrap().records;
     assert_eq!(records[0].title.as_deref(), Some("A test title"));
-    assert!(records[0].extras.is_empty());
+    let extras = &records[0].extras;
+    assert_eq!(extras["ris:TY"], vec!["BOOK"]);
+    assert_eq!(extras["ris:KW"], vec!["keyword one", "keyword two"]);
+    assert_eq!(extras["ris:N1"], vec!["some note"]);
+    assert_eq!(extras.len(), 3);
+}
+
+/// A continuation line of a tag without a field is joined to that tag's last value.
+#[test]
+fn unknown_tag_continuation_joined() {
+    let records = parse("TY  - JOUR\nN1  - first\nN1  - a note that\nwraps\nER  -\n")
+        .unwrap()
+        .records;
+    assert_eq!(
+        records[0].extras["ris:N1"],
+        vec!["first", "a note that wraps"]
+    );
 }
 
 #[test]
@@ -596,10 +615,7 @@ ID  - ref001
 ER  -
 ";
     let records = parse(input).unwrap().records;
-    assert_eq!(
-        records[0].extras.get("ID").map(String::as_str),
-        Some("ref001")
-    );
+    assert_eq!(first_extra(&records[0], "ris:ID"), Some("ref001"));
 }
 
 // -- Error cases --
@@ -701,6 +717,43 @@ fn continuation_of_unread_tag_not_reported() {
 
 // -- Serialization --
 
+/// Only `ris:` extras are written; keys of other formats are kept on the record but not written.
+#[test]
+fn serialize_writes_only_ris_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("ris:KW", "cats")
+        .extra("bibtex:note", "a note")
+        .extra("nbib:OT", "other term")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains("KW  - cats\n"));
+    assert!(!output.contains("a note"));
+    assert!(!output.contains("other term"));
+}
+
+/// The record type comes from `ris:TY`, falling back to `JOUR`.
+#[test]
+fn serialize_record_type() {
+    let book = Record::builder().extra("ris:TY", "BOOK").build();
+    assert!(serialize(&[book]).starts_with("TY  - BOOK\n"));
+    assert!(serialize(&[Record::default()]).starts_with("TY  - JOUR\n"));
+}
+
+/// Extras that are not valid tags, or that name a tag the parser reads, are not written: they would
+/// break the output or be read back into a field.
+#[test]
+fn serialize_skips_unwritable_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("ris:foo", "not a tag")
+        .extra("ris:T2", "would become the journal")
+        .extra("ris:ER", "would end the record")
+        .build();
+    let output = serialize(&[record]);
+    assert_eq!(output, "TY  - JOUR\nTI  - T\nER  -\n");
+}
+
 #[test]
 fn serialize_multiple_records() {
     let a = Record::builder().title("First").build();
@@ -749,6 +802,33 @@ fn format_ris_date(date: PublicationDate) -> String {
     format!("{}/{month}/{day}/", date.year)
 }
 
+/// The tags the `RIS` parser reads into fields or record structure. A copy of the parser's list, so
+/// that the tests pin it.
+const RIS_READ_TAGS: [&str; 22] = [
+    "TY", "ER", "TI", "T1", "AU", "A1", "PY", "Y1", "DO", "SP", "EP", "VL", "IS", "AB", "N2", "SN",
+    "JF", "T2", "JO", "JA", "J2", "J1",
+];
+
+/// Extras as `RIS` parsing produces them: a record type, and up to four tags the parser does not
+/// read, each with one to three values in order.
+fn arb_ris_extras() -> impl Strategy<Value = HashMap<String, Vec<String>>> {
+    let unread_tag = "[A-Z][A-Z0-9]".prop_filter("tag must not be read", |tag| {
+        !RIS_READ_TAGS.contains(&tag.as_str())
+    });
+    (
+        select(vec!["JOUR", "BOOK", "CHAP"]),
+        proptest::collection::hash_map(unread_tag, vec(arb_text(40), 1..=3), 0..=4),
+    )
+        .prop_map(|(record_type, unread)| {
+            let mut extras: HashMap<String, Vec<String>> = unread
+                .into_iter()
+                .map(|(tag, values)| (format!("ris:{tag}"), values))
+                .collect();
+            extras.insert("ris:TY".to_owned(), vec![record_type.to_owned()]);
+            extras
+        })
+}
+
 fn arb_ris_record() -> impl Strategy<Value = Record> {
     (
         proptest::option::of(arb_text(80)),
@@ -762,7 +842,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
         proptest::option::of(arb_text(200)),
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
-            proptest::option::of("[A-Za-z0-9]{1,10}"),
+            arb_ris_extras(),
         ),
     )
         .prop_map(
@@ -776,12 +856,8 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, id),
+                (isbn, extras),
             )| {
-                let mut extras = HashMap::new();
-                if let Some(id) = id {
-                    extras.insert("ID".into(), id);
-                }
                 {
                     let mut record = Record::default();
                     record.title = title;
@@ -839,7 +915,11 @@ fn adversarial_values_round_trip(
     let title = format!("{padding} {tag_like} {padding}")
         .trim_end()
         .to_owned();
-    let record = Record::builder().title(title).build();
+    // Parsing records the type, so the expected record carries the default one.
+    let record = Record::builder()
+        .title(title)
+        .extra("ris:TY", "JOUR")
+        .build();
     let serialized = serialize(std::slice::from_ref(&record));
     let reparsed = parse(&serialized).unwrap().records;
     prop_assert_eq!(vec![record], reparsed);
@@ -1042,4 +1122,73 @@ fn byte_order_mark_does_not_change_result(
     #[strategy(arb_input_without_byte_order_mark())] input: String,
 ) {
     prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
+}
+
+// -- Extras properties --
+
+/// Keys of the other formats, which `RIS` serialisation must never write.
+const FOREIGN_KEYS: [&str; 3] = ["nbib:OT", "bibtex:note", "endnote:keywords/keyword"];
+
+/// A tag lands in `extras` exactly when the parser does not read it.
+#[proptest]
+fn extras_hold_exactly_the_unread_tags(
+    #[strategy("[A-Z0-9]{2}")]
+    #[filter(!matches!(#tag.as_str(), "TY" | "ER"))]
+    tag: String,
+) {
+    let records = parse(&format!("TY  - JOUR\n{tag}  - value\nER  -\n"))
+        .unwrap()
+        .records;
+    let kept = records[0].extras.contains_key(&format!("ris:{tag}"));
+    prop_assert_eq!(kept, !RIS_READ_TAGS.contains(&tag.as_str()));
+}
+
+/// An extra naming a tag the parser reads is never written, so it cannot leak into a field. `TY` is
+/// left out: it is written from `ris:TY` by design.
+#[proptest]
+fn read_tags_never_written_from_extras(
+    #[strategy(select(RIS_READ_TAGS[1..].to_vec()))] tag: &'static str,
+    #[strategy(arb_ris_record())] record: Record,
+) {
+    let mut with_read_tag = record.clone();
+    with_read_tag
+        .extras
+        .insert(format!("ris:{tag}"), vec!["leaked value".to_owned()]);
+    prop_assert_eq!(serialize(&[with_read_tag]), serialize(&[record]));
+}
+
+/// Extras of other formats are kept on the record but never written as `RIS` tags.
+#[proptest]
+fn foreign_extras_not_written(
+    #[strategy(arb_ris_record())] record: Record,
+    #[strategy(arb_text(30))] value: String,
+) {
+    let mut with_foreign = record.clone();
+    for key in FOREIGN_KEYS {
+        with_foreign
+            .extras
+            .insert(key.to_owned(), vec![value.clone()]);
+    }
+    prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// Records read from source text with arbitrary unread tags and values come back unchanged when
+/// written and read again.
+#[proptest]
+fn records_stable_through_serialize(
+    #[strategy(proptest::collection::vec(("[A-Z][A-Z0-9]", arb_raw_value()), 0..6))] lines: Vec<(
+        String,
+        String,
+    )>,
+) {
+    let mut input = String::from("TY  - JOUR\nTI  - A title\n");
+    for (tag, value) in &lines {
+        if !RIS_READ_TAGS.contains(&tag.as_str()) {
+            writeln!(input, "{tag}  - {value}").unwrap();
+        }
+    }
+    input.push_str("ER  -\n");
+    let first = parse(&input).unwrap().records;
+    let second = parse(&serialize(&first)).unwrap().records;
+    prop_assert_eq!(second, first);
 }

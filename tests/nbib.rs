@@ -10,7 +10,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::nbib::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume};
+use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume, first_extra};
 
 // -- Core parsing --
 
@@ -55,7 +55,7 @@ IS  - 1234-5678
         Some("This is the abstract text.")
     );
     assert_eq!(r.isbn.as_deref(), Some("1234-5678"));
-    assert_eq!(r.extras.get("PMID").map(String::as_str), Some("12345678"));
+    assert_eq!(first_extra(r, "nbib:PMID"), Some("12345678"));
 }
 
 #[test]
@@ -151,16 +151,34 @@ fn windows_line_endings() {
     assert_eq!(records[0].authors, vec!["Doe, Jane"]);
 }
 
+/// Tags without a field are kept in `extras` under `nbib:`, with repeated tags keeping every value
+/// in order.
 #[test]
-fn unknown_tags_ignored() {
+fn unknown_tags_kept_in_extras() {
     let input = "\
 TI  - A test title
 OT  - keyword one
+OT  - keyword two
 MH  - mesh heading
 ";
     let records = parse(input).unwrap().records;
     assert_eq!(records[0].title.as_deref(), Some("A test title"));
-    assert!(records[0].extras.is_empty());
+    let extras = &records[0].extras;
+    assert_eq!(extras["nbib:OT"], vec!["keyword one", "keyword two"]);
+    assert_eq!(extras["nbib:MH"], vec!["mesh heading"]);
+    assert_eq!(extras.len(), 2);
+}
+
+/// A continuation line of a tag without a field is joined to that tag's last value.
+#[test]
+fn unknown_tag_continuation_joined() {
+    let records = parse("TI  - t\nAD  - An affiliation that\n      wraps\n")
+        .unwrap()
+        .records;
+    assert_eq!(
+        records[0].extras["nbib:AD"],
+        vec!["An affiliation that wraps"]
+    );
 }
 
 // -- Authors --
@@ -472,14 +490,8 @@ TI  - A test title
 ";
 
     let records = parse(input).unwrap().records;
-    assert_eq!(
-        records[0].extras.get("PMID").map(String::as_str),
-        Some("12345678")
-    );
-    assert_eq!(
-        records[0].extras.get("PMC").map(String::as_str),
-        Some("PMC9876543")
-    );
+    assert_eq!(first_extra(&records[0], "nbib:PMID"), Some("12345678"));
+    assert_eq!(first_extra(&records[0], "nbib:PMC"), Some("PMC9876543"));
 }
 
 // -- Error cases --
@@ -499,10 +511,7 @@ fn leading_byte_order_mark_ignored() {
     let parsed = parse(&format!("\u{feff}{input}")).unwrap();
     assert_eq!(parsed, parse(input).unwrap());
     assert_eq!(parsed.records.len(), 1);
-    assert_eq!(
-        parsed.records[0].extras.get("PMID").map(String::as_str),
-        Some("1")
-    );
+    assert_eq!(first_extra(&parsed.records[0], "nbib:PMID"), Some("1"));
     assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 }
 
@@ -524,6 +533,31 @@ DP  - 2024
 }
 
 // -- Serialization --
+
+/// Only `nbib:` extras are written, `PMID` first; keys of other formats are not written.
+#[test]
+fn serialize_writes_only_nbib_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("nbib:PMC", "PMC1")
+        .extra("nbib:PMID", "1")
+        .extra("ris:KW", "cats")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.starts_with("PMID- 1\nPMC - PMC1\n"));
+    assert!(!output.contains("cats"));
+}
+
+/// Extras that are not valid tags, or that name a tag the parser reads, are not written.
+#[test]
+fn serialize_skips_unwritable_extras() {
+    let record = Record::builder()
+        .title("T")
+        .extra("nbib:TOOLONG", "x")
+        .extra("nbib:AU", "would become an author")
+        .build();
+    assert_eq!(serialize(&[record]), "TI  - T\n\n");
+}
 
 #[test]
 fn serialize_multiple_records() {
@@ -568,6 +602,35 @@ fn format_nbib_date(date: PublicationDate) -> String {
     }
 }
 
+/// The tags the `NBIB` parser reads into fields. A copy of the parser's list, so that the tests pin
+/// it.
+const NBIB_READ_TAGS: [&str; 14] = [
+    "TI", "BTI", "CTI", "FAU", "AU", "DP", "JT", "LID", "AID", "PG", "VI", "IP", "AB", "IS",
+];
+
+/// Extras as `NBIB` parsing produces them: up to four tags the parser does not read (such as
+/// `PMID`), each with one to three values in order.
+fn arb_nbib_extras() -> impl Strategy<Value = HashMap<String, Vec<String>>> {
+    let unread_tag = "[A-Z]{2,4}".prop_filter("tag must not be read", |tag| {
+        !NBIB_READ_TAGS.contains(&tag.as_str())
+    });
+    let pmid = proptest::option::of("[0-9]{5,8}");
+    (
+        pmid,
+        proptest::collection::hash_map(unread_tag, vec(arb_text(40), 1..=3), 0..=3),
+    )
+        .prop_map(|(pmid, unread)| {
+            let mut extras: HashMap<String, Vec<String>> = unread
+                .into_iter()
+                .map(|(tag, values)| (format!("nbib:{tag}"), values))
+                .collect();
+            if let Some(pmid) = pmid {
+                extras.insert("nbib:PMID".to_owned(), vec![pmid]);
+            }
+            extras
+        })
+}
+
 fn arb_nbib_record() -> impl Strategy<Value = Record> {
     (
         proptest::option::of(arb_text(80)),
@@ -581,8 +644,7 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
         proptest::option::of(arb_text(300)),
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
-            proptest::option::of("[0-9]{5,8}"),
-            proptest::option::of("PMC[0-9]{5,8}"),
+            arb_nbib_extras(),
         ),
     )
         .prop_map(
@@ -596,15 +658,8 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, pmid, pmc),
+                (isbn, extras),
             )| {
-                let mut extras = HashMap::new();
-                if let Some(pmid) = pmid {
-                    extras.insert("PMID".into(), pmid);
-                }
-                if let Some(pmc) = pmc {
-                    extras.insert("PMC".into(), pmc);
-                }
                 {
                     let mut record = Record::default();
                     record.title = title;
@@ -874,4 +929,67 @@ fn byte_order_mark_does_not_change_result(
     #[strategy(arb_input_without_byte_order_mark())] input: String,
 ) {
     prop_assert_eq!(parse(&format!("\u{feff}{input}")), parse(&input));
+}
+
+// -- Extras properties --
+
+/// Keys of the other formats, which `NBIB` serialisation must never write.
+const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "bibtex:note", "endnote:keywords/keyword"];
+
+/// A tag lands in `extras` exactly when the parser does not read it.
+#[proptest]
+fn extras_hold_exactly_the_unread_tags(#[strategy("[A-Z0-9]{2,4}")] tag: String) {
+    let records = parse(&format!("TI  - t\n{tag:<4}- value\n"))
+        .unwrap()
+        .records;
+    let kept = records[0].extras.contains_key(&format!("nbib:{tag}"));
+    prop_assert_eq!(kept, !NBIB_READ_TAGS.contains(&tag.as_str()));
+}
+
+/// An extra naming a tag the parser reads is never written, so it cannot leak into a field.
+#[proptest]
+fn read_tags_never_written_from_extras(
+    #[strategy(select(NBIB_READ_TAGS.to_vec()))] tag: &'static str,
+    #[strategy(arb_nbib_record())] record: Record,
+) {
+    let mut with_read_tag = record.clone();
+    with_read_tag
+        .extras
+        .insert(format!("nbib:{tag}"), vec!["leaked value".to_owned()]);
+    prop_assert_eq!(serialize(&[with_read_tag]), serialize(&[record]));
+}
+
+/// Extras of other formats are kept on the record but never written as `NBIB` tags.
+#[proptest]
+fn foreign_extras_not_written(
+    #[strategy(arb_nbib_record())] record: Record,
+    #[strategy(arb_text(30))] value: String,
+) {
+    let mut with_foreign = record.clone();
+    for key in FOREIGN_KEYS {
+        with_foreign
+            .extras
+            .insert(key.to_owned(), vec![value.clone()]);
+    }
+    prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// Records read from source text with arbitrary unread tags and values come back unchanged when
+/// written and read again.
+#[proptest]
+fn records_stable_through_serialize(
+    #[strategy(proptest::collection::vec(("[A-Z]{2,4}", arb_raw_value()), 0..6))] lines: Vec<(
+        String,
+        String,
+    )>,
+) {
+    let mut input = String::from("TI  - A title\n");
+    for (tag, value) in &lines {
+        if !NBIB_READ_TAGS.contains(&tag.as_str()) {
+            writeln!(input, "{tag:<4}- {value}").unwrap();
+        }
+    }
+    let first = parse(&input).unwrap().records;
+    let second = parse(&serialize(&first)).unwrap().records;
+    prop_assert_eq!(second, first);
 }

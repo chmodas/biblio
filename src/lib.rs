@@ -19,6 +19,8 @@
 //! let records = bibtex::parse(bibtex_input).unwrap().records;
 //! let ris_output = ris::serialize(&records);
 //! assert!(ris_output.contains("TI  - An interesting finding"));
+//! // Fields only `BibTeX` has, such as the citation key, are not written into the `RIS`.
+//! assert!(!ris_output.contains("doe2024"));
 //! ```
 pub mod bibtex;
 pub mod endnote_xml;

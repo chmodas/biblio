@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use biblio::PublicationDate;
+use biblio::{PublicationDate, Record};
 
 /// Printable ASCII without `\n` `\r` – safe for single-line bibliographic values.
 pub const VALUE_CHARS: &str = "[A-Za-z0-9 .,;:!?'\"()\\[\\]{}/<>@#$%^&*+=_~-]";
@@ -64,4 +64,9 @@ pub fn arb_raw_value() -> impl Strategy<Value = String> {
         1 => "[ \u{3000}]{1,3}\\PC{1,40}",
         1 => "\\PC{200,400}",
     ]
+}
+
+/// The first value of `record`'s extra `key`, if any.
+pub fn first_extra<'a>(record: &'a Record, key: &str) -> Option<&'a str> {
+    record.extras.get(key)?.first().map(String::as_str)
 }
