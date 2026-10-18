@@ -61,6 +61,9 @@ pub(super) struct Cost {
     scans: u64,
     /// Bytes of text produced.
     bytes: u64,
+    /// Commas in the text produced, each of which may separate one more key when the text is a
+    /// `crossref` or `xdata` value.
+    commas: u64,
 }
 
 impl Cost {
@@ -70,6 +73,7 @@ impl Cost {
             calls: self.calls.saturating_add(other.calls),
             scans: self.scans.saturating_add(other.scans),
             bytes: self.bytes.saturating_add(other.bytes),
+            commas: self.commas.saturating_add(other.commas),
         }
     }
 
@@ -78,7 +82,8 @@ impl Cost {
     const UNDEFINED: Self = Self {
         calls: 1,
         scans: 0,
-        bytes: LONGEST_MONTH,
+        bytes: LONGEST_MONTH + CHUNK_OVERHEAD,
+        commas: 0,
     };
 }
 
@@ -214,6 +219,10 @@ pub(super) struct Budget {
     scans: u64,
     /// Bytes of expanded text left.
     bytes: u64,
+    /// Entries the parser may still copy while resolving `crossref` and `xdata`.
+    clones: u64,
+    /// Bytes it may still copy while doing so.
+    copied: u64,
 }
 
 impl Default for Budget {
@@ -222,6 +231,8 @@ impl Default for Budget {
             calls: MAX_TOTAL_STRING_CALLS,
             scans: MAX_TOTAL_STRING_SCANS,
             bytes: MAX_TOTAL_STRING_BYTES,
+            clones: MAX_TOTAL_CLONES,
+            copied: MAX_TOTAL_COPIED_BYTES,
         }
     }
 }
@@ -235,6 +246,17 @@ impl Budget {
         self.calls -= cost.calls;
         self.scans -= cost.scans;
         self.bytes -= cost.bytes;
+        true
+    }
+
+    /// Take the work of resolving one entry's references from the budget, or return `false`,
+    /// leaving it unchanged, if it does not fit.
+    fn take_references(&mut self, work: Resolution) -> bool {
+        if work.clones > self.clones || work.copied > self.copied {
+            return false;
+        }
+        self.clones -= work.clones;
+        self.copied -= work.copied;
         true
     }
 }
@@ -351,7 +373,8 @@ pub(super) const MAX_STRING_DEPTH: usize = 64;
 /// doubles at each step reaches this within a dozen steps.
 pub(super) const MAX_STRING_CALLS: u64 = 1 << 12;
 
-/// The most bytes one use of a `@string` may expand to.
+/// The most bytes one use of a `@string` may expand to, weighted by the chunks the text may parse
+/// into (see [`text_weight`]).
 pub(super) const MAX_STRING_EXPANSION: u64 = 1 << 20;
 
 /// The most abbreviation look-ups the uses of `@string`s may cost across one input: about a second
@@ -362,9 +385,9 @@ pub(super) const MAX_TOTAL_STRING_CALLS: u64 = 1 << 22;
 /// half a second of work: each look-up scans the list of definitions in order.
 pub(super) const MAX_TOTAL_STRING_SCANS: u64 = 1 << 29;
 
-/// The most bytes the uses of `@string`s may expand to across one input. The parser keeps several
-/// copies of expanded text, so this bounds its memory to about a hundred megabytes.
-pub(super) const MAX_TOTAL_STRING_BYTES: u64 = 1 << 25;
+/// The most bytes the uses of `@string`s may expand to across one input, weighted by the chunks the
+/// text may parse into, which bounds the parser's memory for them to a few hundred megabytes.
+pub(super) const MAX_TOTAL_STRING_BYTES: u64 = 1 << 27;
 
 /// The length of the longest month name, which an abbreviation without a definition may stand for.
 const LONGEST_MONTH: u64 = 9;
@@ -412,8 +435,9 @@ fn string_graph(strings: &[Pair<'_>]) -> StringGraph {
         for chunk in &strings[node].value.v {
             match chunk.v {
                 RawChunk::Normal(text) => {
-                    let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                    let bytes = text_weight(text);
                     graph.own[node].bytes = graph.own[node].bytes.saturating_add(bytes);
+                    graph.own[node].commas = graph.own[node].commas.saturating_add(commas(text));
                 }
                 RawChunk::Abbreviation(name) => {
                     if let Some(&target) = first.get(name) {
@@ -724,14 +748,19 @@ fn remove_field(entry: &mut RawEntry<'_>, field: ReferenceField) {
         .retain(|pair| ReferenceField::of(pair.key.v) != Some(field));
 }
 
-/// Break every cycle of `crossref` and `xdata` references, reporting each entry that lost a field.
+/// Break every cycle of `crossref` and `xdata` references, and bound the work of resolving the
+/// rest, reporting each entry that lost a field.
 ///
 /// A depth-first search over the entries, in order, finds the references that close a cycle. The
 /// field each came from is removed in full, so an `xdata` listing several entries loses all of
-/// them. `lines` holds the line of each entry.
+/// them. Then [`bound_chains`] removes the references of entries whose resolution would go too
+/// deep or copy too much. `lines` holds the line of each entry, `strings` the cost of each
+/// `@string`, and `budget` the work the input may still cause.
 pub(super) fn references(
     raw: &mut RawBibliography<'_>,
     lines: &[usize],
+    strings: &StringTable<'_>,
+    budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let has_references = raw.entries.iter().any(|entry| {
@@ -767,6 +796,197 @@ pub(super) fn references(
             remove_field(&mut raw.entries[entry].v, field);
         }
         diagnostics.push(Diagnostic::ReferenceCycle { line: lines[entry] });
+    }
+
+    // What is left has no cycle.
+    let remaining: Vec<Vec<usize>> = graph
+        .iter()
+        .zip(&broken)
+        .map(|(targets, broken)| {
+            targets
+                .iter()
+                .filter(|(_, field)| !broken.contains(field))
+                .map(|&(target, _)| target)
+                .collect()
+        })
+        .collect();
+    bound_chains(raw, &remaining, lines, strings, budget, diagnostics);
+}
+
+/// The longest chain of references resolved for one entry. The parser recurses once for each.
+pub(super) const MAX_REFERENCE_DEPTH: usize = 64;
+
+/// The most entries the parser may copy while resolving one entry's references. It copies every
+/// entry on every path, without remembering any, so branching `xdata` grows this quickly.
+pub(super) const MAX_CLONES: u64 = 1 << 12;
+
+/// The most bytes the parser may copy while resolving one entry's references, measured as an upper
+/// bound on memory (see [`entry_bytes`]). The parser holds an entry's copies at once and drops them
+/// once it has resolved the entry, so this bounds its peak memory.
+pub(super) const MAX_COPIED_BYTES: u64 = 1 << 22;
+
+/// The most entries the parser may copy while resolving references across one input.
+pub(super) const MAX_TOTAL_CLONES: u64 = 1 << 18;
+
+/// The most bytes the parser may copy while resolving references across one input, measured the
+/// same way: about half a second of copying, and a bound on the inherited fields the records keep.
+/// A file of some 60,000 `crossref` children of typical proceedings stays below it.
+pub(super) const MAX_TOTAL_COPIED_BYTES: u64 = 1 << 29;
+
+/// The work of resolving one entry's references.
+#[derive(Clone, Copy, Default)]
+struct Resolution {
+    /// The longest chain of references below the entry.
+    depth: usize,
+    /// Entries copied.
+    clones: u64,
+    /// Bytes copied.
+    copied: u64,
+}
+
+/// An upper bound on the memory a copy of `entry` takes once parsed: each field's key and
+/// overhead, and its text, weighted by the chunks it may parse into, with `@string`s expanded.
+fn entry_bytes(entry: &RawEntry<'_>, strings: &StringTable<'_>) -> u64 {
+    entry.fields.iter().fold(0, |total, field| {
+        let key = u64::try_from(field.key.v.len()).unwrap_or(u64::MAX);
+        let value = field.value.v.iter().fold(0_u64, |sum, chunk| {
+            let bytes = match chunk.v {
+                RawChunk::Normal(text) => text_weight(text),
+                RawChunk::Abbreviation(name) => strings.cost(name).bytes,
+            };
+            sum.saturating_add(bytes)
+        });
+        total
+            .saturating_add(FIELD_OVERHEAD)
+            .saturating_add(key)
+            .saturating_add(value)
+    })
+}
+
+/// What a parsed field costs the parser beyond its text: the key's allocation, its place in the
+/// entry's map and its list of chunks, measured at under 200 bytes.
+const FIELD_OVERHEAD: u64 = 192;
+
+/// What a parsed chunk of text costs the parser beyond its bytes.
+const CHUNK_OVERHEAD: u64 = 64;
+
+/// What reading and looking up one key of a `crossref` or `xdata` value costs: the key is split
+/// out, formatted and looked up, which takes a few allocations.
+const KEY_OVERHEAD: u64 = 256;
+
+/// The commas in `text`.
+fn commas(text: &str) -> u64 {
+    u64::try_from(text.bytes().filter(|&b| b == b',').count()).unwrap_or(u64::MAX)
+}
+
+/// What reading the keys of `entry`'s `crossref` and `xdata` fields costs, each time the entry is
+/// resolved, whether or not they name an entry: a key for each field and for each comma in it,
+/// counting the commas that its `@string`s expand to.
+fn key_bytes(entry: &RawEntry<'_>, strings: &StringTable<'_>) -> u64 {
+    entry
+        .fields
+        .iter()
+        .filter(|field| ReferenceField::of(field.key.v).is_some())
+        .fold(0_u64, |count, field| {
+            let separators = field.value.v.iter().fold(0_u64, |sum, chunk| {
+                sum.saturating_add(match chunk.v {
+                    RawChunk::Normal(text) => commas(text),
+                    RawChunk::Abbreviation(name) => strings.cost(name).commas,
+                })
+            });
+            count.saturating_add(separators).saturating_add(1)
+        })
+        .saturating_mul(KEY_OVERHEAD)
+}
+
+/// An upper bound on the memory the parser uses for `text` once parsed: its bytes, and a chunk for
+/// the text and for each character that can start a new one (`$` for maths, `{` and `}` for a
+/// group, `\` for a command, `~` for a space).
+fn text_weight(text: &str) -> u64 {
+    let breaks = text
+        .bytes()
+        .filter(|b| matches!(b, b'$' | b'{' | b'}' | b'\\' | b'~'))
+        .count();
+    let chunks = u64::try_from(breaks).unwrap_or(u64::MAX).saturating_add(1);
+    u64::try_from(text.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(chunks.saturating_mul(CHUNK_OVERHEAD))
+}
+
+/// How many times resolving can copy a parent's field: some fields are copied under several names
+/// (`location` also as `address`, a periodical's `title` as `journaltitle` and `booktitle`).
+const COPY_FACTOR: u64 = 3;
+
+/// Remove the `crossref` and `xdata` of entries whose resolution would go too deep or copy too
+/// much, reporting each, where `targets` is the reference graph with no cycle left.
+///
+/// Resolving an entry copies each entry it refers to, resolves that copy's references the same
+/// way, and keeps nothing between paths. So the work is counted from the targets up, each entry's
+/// after those it refers to; an entry over a limit loses its references, which bounds every entry
+/// that refers to it. Then the entries, in order, draw on the input's budget; one that does not fit
+/// loses its references too.
+fn bound_chains(
+    raw: &mut RawBibliography<'_>,
+    targets: &[Vec<usize>],
+    lines: &[usize],
+    strings: &StringTable<'_>,
+    budget: &mut Budget,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let own: Vec<u64> = raw
+        .entries
+        .iter()
+        .map(|entry| entry_bytes(&entry.v, strings))
+        .collect();
+    // Reading an entry's own keys is part of every resolution of it, even one that finds nothing.
+    let mut work: Vec<Resolution> = raw
+        .entries
+        .iter()
+        .map(|entry| Resolution {
+            copied: key_bytes(&entry.v, strings),
+            ..Resolution::default()
+        })
+        .collect();
+    // The size of each entry once its references are resolved.
+    let mut resolved = own.clone();
+    let mut cut = vec![false; targets.len()];
+    let roots: Vec<usize> = (0..targets.len()).collect();
+    for entry in search_graph(&roots, targets).finished {
+        if targets[entry].is_empty() {
+            continue;
+        }
+        let mut total = work[entry];
+        let mut size = own[entry];
+        for &target in &targets[entry] {
+            let below = work[target];
+            total.depth = total.depth.max(below.depth + 1);
+            total.clones = total.clones.saturating_add(below.clones.saturating_add(1));
+            total.copied = total.copied.saturating_add(
+                resolved[target]
+                    .saturating_mul(COPY_FACTOR)
+                    .saturating_add(below.copied),
+            );
+            size = size.saturating_add(resolved[target]);
+        }
+        if total.depth > MAX_REFERENCE_DEPTH
+            || total.clones > MAX_CLONES
+            || total.copied > MAX_COPIED_BYTES
+        {
+            cut[entry] = true;
+            work[entry] = Resolution::default();
+        } else {
+            work[entry] = total;
+            resolved[entry] = size;
+        }
+    }
+    for entry in 0..targets.len() {
+        let over_budget =
+            !cut[entry] && !targets[entry].is_empty() && !budget.take_references(work[entry]);
+        if cut[entry] || over_budget {
+            remove_field(&mut raw.entries[entry].v, ReferenceField::Crossref);
+            remove_field(&mut raw.entries[entry].v, ReferenceField::Xdata);
+            diagnostics.push(Diagnostic::ReferenceTooDeep { line: lines[entry] });
+        }
     }
 }
 

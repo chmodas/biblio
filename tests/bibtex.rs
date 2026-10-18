@@ -2111,41 +2111,58 @@ fn empty_doubling_strings_bounded() {
     }
 }
 
-/// Uses of `@string`s draw on one budget for the whole input: once it runs out, further entries
-/// that use them are skipped and reported, and the entries before are kept. Uses in `ids`,
+/// The entries, by line, skipped for using `@string`s that expand too far in total.
+fn over_budget_lines(parsed: &biblio::Parsed) -> Vec<usize> {
+    parsed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::SkippedEntry { message, .. }
+                if message == "uses @string definitions that expand too far in total")
+        })
+        .map(Diagnostic::line)
+        .collect()
+}
+
+/// Uses of `@string`s draw on one budget for the whole input: once it runs out, every further
+/// entry that uses them is skipped and reported, and the entries before are kept. Uses in `ids`,
 /// `crossref` and `xdata` count twice.
 #[test]
 fn string_use_budget_shared_by_the_input() {
-    // `a11` costs 4,095 look-ups, so the budget of 4,194,304 covers 1,024 uses.
+    // `a0` to `a11` take lines 1 to 12; the entries follow.
     let mut input = doubling_strings("{x}", 11);
     for i in 0..1_100 {
         writeln!(input, "@article{{e{i}, title = {{T}}, note = a11}}").unwrap();
     }
     let parsed = parse_hostile(&input);
-    assert_eq!(parsed.records.len(), 1_024);
-    assert!(matches!(
-        &parsed.diagnostics[0],
-        Diagnostic::SkippedEntry { line: 1_037, message }
-            if message == "uses @string definitions that expand too far in total"
-    ));
+    let kept = parsed.records.len();
+    assert!(kept > 0 && kept < 1_100, "{kept}");
+    let skipped: Vec<usize> = (13 + kept..13 + 1_100).collect();
+    assert_eq!(over_budget_lines(&parsed), skipped);
 
     let mut twice = doubling_strings("{x}", 11);
-    for i in 0..600 {
+    for i in 0..1_100 {
         writeln!(twice, "@article{{e{i}, title = {{T}}, ids = a11}}").unwrap();
     }
-    assert_eq!(parse_hostile(&twice).records.len(), 512);
+    assert_eq!(parse_hostile(&twice).records.len(), kept / 2);
 }
 
 /// The budget is shared across the input when entries are parsed one by one, here forced by a
 /// broken entry, so splitting the input does not multiply it.
 #[test]
 fn string_use_budget_shared_when_parsing_entries_one_by_one() {
+    let mut whole = doubling_strings("{x}", 11);
+    for i in 0..1_100 {
+        writeln!(whole, "@article{{e{i}, title = {{T}}, note = a11}}").unwrap();
+    }
+    let kept = parse_hostile(&whole).records.len();
+
     let mut input = doubling_strings("{x}", 11);
     input.push_str("@article{broken title = {X}}\n");
     for i in 0..1_100 {
         writeln!(input, "@article{{e{i}, title = {{T}}, note = a11}}").unwrap();
     }
-    assert_eq!(parse_hostile(&input).records.len(), 1_024);
+    assert_eq!(parse_hostile(&input).records.len(), kept);
 }
 
 /// Reference fields are recognised in any case.
@@ -2265,9 +2282,9 @@ fn many_unused_strings_do_not_cost_look_ups() {
     for i in 0..10_000 {
         writeln!(input, "@string{{f{i} = {{x}}}}").unwrap();
     }
-    input.push_str(&doubling_strings("{x}", 11));
+    input.push_str(&doubling_strings("{x}", 6));
     for i in 0..32 {
-        let uses = vec!["a11"; 32].join(" # ");
+        let uses = vec!["a6"; 32].join(" # ");
         writeln!(input, "@article{{e{i}, title = {{T}}, note = {uses}}}").unwrap();
     }
     let start = std::time::Instant::now();
@@ -2346,4 +2363,337 @@ fn long_string_names_dropped() {
         [Diagnostic::SkippedEntry { line: 1, message }]
             if message == "@string with a name longer than 64 bytes"
     ));
+}
+
+// -- Hostile input: reference chains --
+
+/// A `crossref` chain of `links` links: `e0` is the parent, and each `e{i}` refers to `e{i-1}`.
+fn crossref_chain(links: usize) -> String {
+    let mut source = String::from("@book{e0, title = {T}, publisher = {P}}\n");
+    for i in 1..=links {
+        writeln!(
+            source,
+            "@book{{e{i}, title = {{T}}, crossref = {{e{}}}}}",
+            i - 1
+        )
+        .unwrap();
+    }
+    source
+}
+
+/// The references reported as going too deep or copying too much, by line.
+fn too_deep_lines(parsed: &biblio::Parsed) -> Vec<usize> {
+    parsed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::ReferenceTooDeep { .. }))
+        .map(Diagnostic::line)
+        .collect()
+}
+
+/// A chain of 64 references resolves in full; at 65, only the head loses its reference, and every
+/// entry is kept.
+#[test]
+fn reference_chain_depth_bounded() {
+    let parsed = parse_hostile(&crossref_chain(64));
+    assert_eq!(parsed.records.len(), 65);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+    assert_eq!(
+        first_extra(&parsed.records[64], "bibtex:publisher"),
+        Some("P")
+    );
+
+    let parsed = parse_hostile(&crossref_chain(65));
+    assert_eq!(parsed.records.len(), 66);
+    assert_eq!(too_deep_lines(&parsed), vec![66]);
+    assert_eq!(first_extra(&parsed.records[65], "bibtex:crossref"), None);
+}
+
+/// A very long chain no longer overflows the stack: it is cut where it goes too deep.
+#[test]
+fn very_long_reference_chain_cut() {
+    let parsed = parse_hostile(&crossref_chain(20_000));
+    assert_eq!(parsed.records.len(), 20_001);
+    assert_ne!(too_deep_lines(&parsed), Vec::<usize>::new());
+}
+
+/// An `xdata` that doubles at each level is cut where the copies it would make go over a limit,
+/// and the count starts again above the cut, so the cuts come at regular intervals.
+#[test]
+fn doubling_xdata_cut() {
+    let mut input = String::from("@xdata{x0, title = {X}, note = {N}}\n");
+    for i in 1..=31 {
+        writeln!(
+            input,
+            "@xdata{{x{i}, title = {{X}}, xdata = {{x{p}, x{p}}}}}",
+            p = i - 1
+        )
+        .unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 32);
+    // The copies double at each level, so the limit is reached every few levels, and the count
+    // starts again above each cut.
+    let cut = too_deep_lines(&parsed);
+    assert!(cut.len() >= 2, "{cut:?}");
+    assert!(
+        cut.windows(2).all(|pair| pair[1] - pair[0] == cut[0] - 1),
+        "{cut:?}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// An entry listing one parent 4,096 times is resolved; 4,097 times is too many copies. The parent
+/// has no fields, so only the number of copies counts.
+#[test]
+fn xdata_repeats_bounded() {
+    for (repeats, cut) in [(4_096, false), (4_097, true)] {
+        let input = format!(
+            "@xdata{{leaf,}}\n@misc{{k, title = {{K}}, xdata = {{{}}}}}\n",
+            vec!["leaf"; repeats].join(", ")
+        );
+        let parsed = parse_hostile(&input);
+        assert_eq!(
+            too_deep_lines(&parsed),
+            if cut { vec![2] } else { vec![] },
+            "{repeats}"
+        );
+    }
+}
+
+/// A parent whose `xdata` lists many keys that name no entry is read again each time it is copied,
+/// so the keys count towards each referrer's limit. Regression test from code review: they were
+/// counted as free, and a 1 MB parent copied 1,000 times took seconds.
+#[test]
+fn copies_of_long_key_lists_bounded() {
+    let keys: Vec<String> = (0..100_000).map(|i| format!("missing{i}")).collect();
+    let mut input = format!("@xdata{{leaf, xdata = {{{}}}}}\n", keys.join(","));
+    for i in 0..1_000 {
+        writeln!(input, "@misc{{k{i}, title = {{K}}, xdata = {{leaf}}}}").unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 1_001);
+    assert_eq!(too_deep_lines(&parsed), (2..=1_001).collect::<Vec<_>>());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A few missing keys cost little.
+    let parsed = parse_hostile(
+        "@xdata{leaf, note = {N}, xdata = {a, b, c}}\n@misc{k, title = {K}, xdata = {leaf}}\n",
+    );
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 1 }]
+    );
+
+    // Keys listed in a `@string` count the same. Regression test from code review: their commas
+    // were not counted, and this took seconds.
+    let mut input = format!(
+        "@string{{keys = {{{}}}}}\n@xdata{{leaf, xdata = keys}}\n",
+        vec!["q"; 100_000].join(",")
+    );
+    for i in 0..1_000 {
+        writeln!(input, "@misc{{k{i}, title = {{K}}, xdata = {{leaf}}}}").unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 1_001);
+    assert_eq!(too_deep_lines(&parsed), (3..=1_002).collect::<Vec<_>>());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A key given by a `@string` counts once, like any other.
+    let parsed = parse_hostile(
+        "@string{lf = {leaf}}\n@xdata{leaf, note = {N}}\n@misc{k, title = {K}, xdata = lf}\n",
+    );
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::MissingTitle { line: 2 }]
+    );
+}
+
+/// An entry that copies a parent made of many empty fields is bounded by the fields' cost, not
+/// just their text. Regression test from code review: such copies were counted as free and could
+/// take gigabytes.
+#[test]
+fn copies_of_wide_entries_bounded() {
+    let mut leaf = String::from("@xdata{leaf");
+    for i in 0..2_000 {
+        write!(leaf, ", f{i:040} = {{}}").unwrap();
+    }
+    leaf.push_str("}\n");
+    let input = format!(
+        "{leaf}@misc{{k, title = {{K}}, xdata = {{{}}}}}\n",
+        vec!["leaf"; 4_096].join(", ")
+    );
+    assert_eq!(too_deep_lines(&parse_hostile(&input)), vec![2]);
+}
+
+/// An entry that would copy too many bytes loses its references, even with few copies, counting
+/// the text its parents' `@string`s expand to.
+#[test]
+fn copied_bytes_count_string_expansions() {
+    let input = format!(
+        "@string{{big = {{{}}}}}\n@xdata{{leaf, title = {{L}}, note = big}}\n{}",
+        "x".repeat(65_536),
+        format_args!(
+            "@misc{{k, title = {{K}}, xdata = {{{}}}}}\n",
+            vec!["leaf"; 300].join(", ")
+        )
+    );
+    assert_eq!(too_deep_lines(&parse_hostile(&input)), vec![3]);
+}
+
+/// An entry that would copy too many bytes loses its references, even with few copies.
+#[test]
+fn copied_bytes_bounded() {
+    let input = format!(
+        "@xdata{{leaf, title = {{L}}, note = {{{}}}}}\n@misc{{k, title = {{K}}, xdata = {{{}}}}}\n",
+        "x".repeat(65_536),
+        vec!["leaf"; 300].join(", ")
+    );
+    assert_eq!(too_deep_lines(&parse_hostile(&input)), vec![2]);
+}
+
+/// Entries draw on one budget for resolving references: once it runs out, later entries lose
+/// theirs, in order, and earlier ones keep them.
+#[test]
+fn reference_budget_shared_by_the_input() {
+    let leaves: Vec<String> = (0..4_000).map(|i| format!("l{i}")).collect();
+    let mut input = String::new();
+    // Leaves without fields, so that the number of copies is what runs out.
+    for leaf in &leaves {
+        writeln!(input, "@xdata{{{leaf},}}").unwrap();
+    }
+    writeln!(
+        input,
+        "@xdata{{hub, title = {{H}}, xdata = {{{}}}}}",
+        leaves.join(", ")
+    )
+    .unwrap();
+    for i in 0..100 {
+        writeln!(input, "@misc{{k{i}, title = {{T}}, xdata = {{hub}}}}").unwrap();
+    }
+    let parsed = parse_hostile(&input);
+    // The hub copies 4,000 entries and each referrer 4,001, so the budget of 262,144 covers the
+    // hub and 64 referrers.
+    let first_referrer = 4_002;
+    let cut: Vec<usize> = (first_referrer + 64..first_referrer + 100).collect();
+    assert_eq!(too_deep_lines(&parsed), cut);
+}
+
+/// A reference graph with no cycle, in any file order: each entry refers to entries earlier in a
+/// hidden order, through its `crossref` (the first target) and `xdata` (the rest), with repeats and
+/// keys that name no entry.
+#[derive(Arbitrary, Debug)]
+struct AcyclicGraph {
+    /// For each entry in the hidden order, the entries it refers to, as offsets back from it; an
+    /// offset that reaches past the start names no entry.
+    #[strategy(vec(vec(1_usize..5, 0..4), 1..24))]
+    back: Vec<Vec<usize>>,
+    /// The file position of each entry in the hidden order.
+    #[strategy(Just((0..#back.len()).collect::<Vec<usize>>()).prop_shuffle())]
+    position: Vec<usize>,
+    /// The length of each entry's note, so that the limit on copied bytes can be reached.
+    #[strategy(vec(proptest::sample::select(vec![0_usize, 1, 64, 4_096]), #back.len()))]
+    note: Vec<usize>,
+}
+
+/// The copies resolving entry `index` makes, and the longest chain below it, counted the way the
+/// parser resolves: each target is copied and resolved in turn, nothing remembered. Counting stops
+/// once the copies go over `cap`, so that a graph the parser would never resolve is not walked in
+/// full either.
+fn resolution(index: usize, targets: &[Vec<usize>], cap: u64) -> (u64, usize) {
+    let mut copies = 0;
+    let mut deepest = 0;
+    for &target in &targets[index] {
+        let (below, depth) = resolution(target, targets, cap.saturating_sub(copies + 1));
+        copies += 1 + below;
+        deepest = deepest.max(depth + 1);
+        if copies > cap {
+            break;
+        }
+    }
+    (copies, deepest)
+}
+
+/// However entries branch and are ordered, parsing never aborts or hangs and keeps every entry.
+/// Every entry that keeps its references stays within the limits on copies and depth, counted
+/// independently by following the parser's recursion, and an entry far below every limit keeps
+/// them.
+#[proptest]
+fn acyclic_reference_graphs_bounded(input: AcyclicGraph) {
+    let count = input.back.len();
+    // `targets` is indexed by file position.
+    let mut targets: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut source_lines: Vec<String> = vec![String::new(); count];
+    for (hidden, back) in input.back.iter().enumerate() {
+        let file = input.position[hidden];
+        let names: Vec<String> = back
+            .iter()
+            .map(|&b| match hidden.checked_sub(b) {
+                Some(target) => {
+                    targets[file].push(input.position[target]);
+                    format!("x{}", input.position[target])
+                }
+                None => "missing".to_owned(),
+            })
+            .collect();
+        let mut line = format!(
+            "@xdata{{x{file}, note = {{{}}}",
+            "n".repeat(input.note[hidden])
+        );
+        if let Some((first, rest)) = names.split_first() {
+            write!(line, ", crossref = {{{first}}}").unwrap();
+            if !rest.is_empty() {
+                write!(line, ", xdata = {{{}}}", rest.join(", ")).unwrap();
+            }
+        }
+        line.push('}');
+        source_lines[file] = line;
+    }
+    let source = source_lines.join("\n") + "\n";
+    let parsed = parse_hostile(&source);
+    prop_assert_eq!(parsed.records.len(), count);
+
+    let cut: HashSet<usize> = too_deep_lines(&parsed)
+        .into_iter()
+        .map(|line| line - 1)
+        .collect();
+    let mut kept_targets = targets.clone();
+    for &entry in &cut {
+        kept_targets[entry].clear();
+    }
+    for entry in 0..count {
+        if cut.contains(&entry) {
+            continue;
+        }
+        let (copies, depth) = resolution(entry, &kept_targets, 4_096);
+        prop_assert!(
+            copies <= 4_096 && depth <= 64,
+            "entry {entry}: {copies} copies, depth {depth}"
+        );
+        let (all_copies, _) = resolution(entry, &targets, 16);
+        if all_copies <= 16 && input.note.iter().all(|&n| n <= 64) {
+            prop_assert!(!cut.contains(&entry));
+        }
+    }
+    for &entry in &cut {
+        prop_assert!(
+            !targets[entry].is_empty(),
+            "entry {entry} cut without references"
+        );
+    }
 }

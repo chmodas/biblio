@@ -44,14 +44,19 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///   same way, unused ones included, and so are those whose chain of definitions is longer than
 ///   64, or whose use would cost more than 4,096 look-ups or expand to more than 1 MiB. Across
 ///   the input, the uses of `@string`s may cost at most about 4 million look-ups, half a billion
-///   comparisons while finding definitions, and 32 MiB of text; an entry that would go over that
-///   is skipped. `@string` names longer than 64 bytes are dropped too. If the whole input cannot
-///   be read at once, entries are read again one by one with a fresh budget, so the work is
-///   bounded by twice the budget. Real files stay far below these limits, but a very large file
-///   that uses thousands of different `@string`s may have its later entries skipped.
+///   comparisons while finding definitions, and about 128 MiB of parsed text; an entry that would
+///   go over that is skipped. `@string` names longer than 64 bytes are dropped too. If the whole
+///   input cannot be read at once, entries are read again one by one with a fresh budget, so the
+///   work is bounded by twice the budget. Real files stay far below these limits, but a very
+///   large file that uses thousands of different `@string`s may have its later entries skipped.
 /// - [`Diagnostic::ReferenceCycle`]: an entry's `crossref` or `xdata` led back to itself,
 ///   directly, through other entries or through `ids` aliases. Entries are searched in order, and
 ///   the field whose reference closes the cycle is removed in full; the entry is kept.
+/// - [`Diagnostic::ReferenceTooDeep`]: resolving an entry's `crossref` and `xdata` would follow a
+///   chain longer than 64, copy more than 4,096 entries or about 4 MiB, or go over the input's
+///   budget of 262,144 copies and about 512 MiB; both fields are removed and the entry is kept.
+///   Sizes are upper bounds on the parser's work, counting field names, the pieces text is parsed
+///   into, and every `crossref` or `xdata` key read, whether or not it names an entry.
 ///
 /// The whole input is first parsed at once, which resolves `@string` macros and `crossref`
 /// inheritance. If that fails, the input is split into entries at lines starting with `@type{` or
@@ -128,7 +133,7 @@ fn parse_whole(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Dia
         diagnostics,
     );
     raw.abbreviations = strings.needed(&raw.abbreviations, &raw.entries);
-    guard::references(&mut raw, &lines, diagnostics);
+    guard::references(&mut raw, &lines, &strings, &mut budget, diagnostics);
     let Ok(bibliography) = Bibliography::from_raw(raw) else {
         return false;
     };
@@ -185,7 +190,7 @@ fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<D
             entries,
             abbreviations: needed,
         };
-        guard::references(&mut raw, &lines, diagnostics);
+        guard::references(&mut raw, &lines, &strings, &mut budget, diagnostics);
         match Bibliography::from_raw(raw) {
             Ok(bibliography) => {
                 for entry in bibliography.iter() {

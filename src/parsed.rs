@@ -62,6 +62,14 @@ pub enum Diagnostic {
         line: usize,
     },
 
+    /// Resolving a `BibTeX` entry's `crossref` and `xdata` would have gone too deep, branched too
+    /// much or copied too much, or the input's budget for resolving them ran out. Both fields were
+    /// removed in full, so the entry inherits nothing. The entry is kept.
+    ReferenceTooDeep {
+        /// Line where the entry starts.
+        line: usize,
+    },
+
     /// The input broke off: an `EndNote XML` syntax error, or the end of the input inside a record.
     /// The records before it are kept, the record in progress is dropped, and parsing stops.
     Truncated {
@@ -81,6 +89,7 @@ impl Diagnostic {
             | Self::UnterminatedRecord { line }
             | Self::IgnoredLine { line }
             | Self::ReferenceCycle { line }
+            | Self::ReferenceTooDeep { line }
             | Self::SkippedEntry { line, .. }
             | Self::Truncated { line, .. } => *line,
         }
@@ -104,6 +113,10 @@ impl fmt::Display for Diagnostic {
                     "reference cycle at line {line}: crossref or xdata removed"
                 )
             }
+            Self::ReferenceTooDeep { line } => write!(
+                f,
+                "references at line {line} go too deep or copy too much: crossref and xdata removed"
+            ),
             Self::Truncated { line, message } => {
                 write!(f, "input truncated at line {line}: {message}")
             }
