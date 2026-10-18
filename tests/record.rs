@@ -80,6 +80,10 @@ fn diagnostic_line_and_display() {
             Diagnostic::ReferenceCycle { line: 6 },
             "reference cycle at line 6: crossref or xdata removed",
         ),
+        (
+            Diagnostic::ReferenceTooDeep { line: 7 },
+            "references at line 7 go too deep or copy too much: crossref and xdata removed",
+        ),
     ];
     for (expected_line, (diagnostic, text)) in (1..).zip(cases) {
         assert_eq!(diagnostic.line(), expected_line);
