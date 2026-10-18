@@ -76,6 +76,10 @@ fn diagnostic_line_and_display() {
             },
             "input truncated at line 5: input ended inside a record",
         ),
+        (
+            Diagnostic::ReferenceCycle { line: 6 },
+            "reference cycle at line 6: crossref or xdata removed",
+        ),
     ];
     for (expected_line, (diagnostic, text)) in (1..).zip(cases) {
         assert_eq!(diagnostic.line(), expected_line);

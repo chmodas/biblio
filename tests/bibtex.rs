@@ -3,7 +3,7 @@ mod common;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::subsequence;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use test_strategy::{Arbitrary, proptest};
 
@@ -1439,6 +1439,21 @@ fn records_stable_through_serialize(
     prop_assert_eq!(second, first.records);
 }
 
+// -- Hostile input --
+
+/// Parse `input` on a thread with the stack a test thread gets by default, set explicitly so that
+/// settings such as `RUST_MIN_STACK` cannot hide a shrinking margin. An input that overflows the
+/// stack still aborts the test run.
+fn parse_hostile(input: &str) -> biblio::Parsed {
+    let input = input.to_owned();
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || parse(&input).unwrap())
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 // -- Hostile input: nesting --
 
 /// The deepest brace nesting the parser accepts in a value; a copy of the parser's limit.
@@ -1454,16 +1469,15 @@ fn nested_commands(depth: usize) -> String {
 #[test]
 fn nesting_at_limit_kept_beyond_skipped() {
     let at_limit = nested_commands(MAX_NESTING);
-    let parsed = parse(&format!(
+    let parsed = parse_hostile(&format!(
         "@article{{a, title = {{T}}, note = {{{at_limit}}}}}\n"
-    ))
-    .unwrap();
+    ));
     assert_eq!(parsed.records.len(), 1);
     assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 
     let beyond = nested_commands(MAX_NESTING + 1);
     let input = format!("@article{{a, title = {{A}}}}\n@article{{b, note = {{{beyond}}}}}\n");
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     assert_eq!(titles(&parsed), vec![Some("A")]);
     assert!(matches!(
         parsed.diagnostics.as_slice(),
@@ -1480,7 +1494,7 @@ fn nesting_caught_when_parsing_entries_one_by_one() {
         "@article{{a, note = {{{beyond}}}}} @article{{b, title = {{B}}}}\n{}",
         "@article{c title = {C}}\n"
     );
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     assert_eq!(titles(&parsed), vec![Some("B")]);
     let lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
     assert_eq!(lines, vec![1, 2]);
@@ -1497,7 +1511,7 @@ fn deep_groups_and_quoted_braces_skipped() {
     );
     let quoted = "{".repeat(MAX_NESTING + 1);
     for value in [format!("{{{groups}}}"), format!("\"{quoted}\"")] {
-        let parsed = parse(&format!("@article{{a, note = {value}}}\n")).unwrap();
+        let parsed = parse_hostile(&format!("@article{{a, note = {value}}}\n"));
         assert_eq!(parsed.records, Vec::<Record>::new(), "{value}");
         assert!(
             matches!(
@@ -1515,7 +1529,7 @@ fn deep_groups_and_quoted_braces_skipped() {
 #[test]
 fn deep_crossref_value_skipped() {
     let beyond = nested_commands(MAX_NESTING + 1);
-    let parsed = parse(&format!("@article{{a, crossref = {{{beyond}}}}}\n")).unwrap();
+    let parsed = parse_hostile(&format!("@article{{a, crossref = {{{beyond}}}}}\n"));
     assert_eq!(parsed.records, Vec::<Record>::new());
     assert!(matches!(
         parsed.diagnostics.as_slice(),
@@ -1532,7 +1546,7 @@ fn deep_string_removed_with_its_redefinitions() {
         "@string{{s = {{{beyond}}}}}\n{}",
         "@string{s = {shallow}}\n@article{a, title = s}\n@article{b, title = {B}}\n"
     );
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     assert_eq!(titles(&parsed), vec![Some("B")]);
     let reported: Vec<(usize, String)> = parsed
         .diagnostics
@@ -1550,8 +1564,8 @@ fn deep_string_removed_with_its_redefinitions() {
     assert_eq!(reported.len(), 2);
 }
 
-/// Values at the nesting limit, reached through a long chain of `@string`s, parse on a test
-/// thread's default stack.
+/// Values at the nesting limit, reached through a long chain of `@string`s, parse on a 2 MiB
+/// stack.
 #[test]
 fn nesting_limit_fits_on_a_test_thread() {
     let mut input = format!("@string{{s0 = {{{}}}}}\n", nested_commands(MAX_NESTING));
@@ -1559,25 +1573,16 @@ fn nesting_limit_fits_on_a_test_thread() {
         writeln!(input, "@string{{s{i} = s{}}}", i - 1).unwrap();
     }
     input.push_str("@article{a, title = {T}, note = s63}\n");
-    // A thread of the size test threads get by default, set explicitly so that settings such as
-    // `RUST_MIN_STACK` cannot hide a shrinking margin.
-    let records = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
-        .spawn(move || parse(&input).unwrap().records.len())
-        .unwrap()
-        .join()
-        .unwrap();
-    assert_eq!(records, 1);
+    assert_eq!(parse_hostile(&input).records.len(), 1);
 }
 
 /// Command arguments nested 10,000 deep are skipped rather than overflowing the stack.
 #[test]
 fn very_deep_nesting_skipped() {
-    let parsed = parse(&format!(
+    let parsed = parse_hostile(&format!(
         "@article{{a, title = {{{}}}}}\n",
         nested_commands(10_000)
-    ))
-    .unwrap();
+    ));
     assert_eq!(parsed.records, Vec::<Record>::new());
     assert_eq!(parsed.diagnostics.len(), 1);
 }
@@ -1614,7 +1619,7 @@ fn nesting_never_aborts(
 ) {
     let value: String = pieces.concat();
     let input = format!("@article{{a, title = {{T}}, note = {{{value}}}}}\n");
-    prop_assert!(parse(&input).is_ok());
+    parse_hostile(&input);
 }
 
 /// A well-formed value made of commands, groups, maths and letters, with every brace closed, up to
@@ -1647,7 +1652,7 @@ fn arb_balanced_value() -> impl Strategy<Value = String> {
 #[proptest]
 fn deep_values_skipped_exactly(#[strategy(arb_balanced_value())] value: String) {
     let input = format!("@article{{a, title = {{T}}, note = {{{value}}}}}\n");
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     let too_deep = brace_depth(&value) > MAX_NESTING;
     prop_assert_eq!(parsed.records.is_empty(), too_deep);
     prop_assert_eq!(parsed.diagnostics.len(), usize::from(too_deep));
@@ -1661,7 +1666,7 @@ fn deep_string_line_on_the_per_entry_path() {
     let input = format!(
         "@article{{x title = {{X}}}}\n@article{{a, title = {{A}}}}\n\n@string{{s = {{{beyond}}}}}\n"
     );
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     let lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
     assert_eq!(lines, vec![1, 4]);
 }
@@ -1675,7 +1680,7 @@ fn concatenated_string_parts_judged_separately() {
         "@string{{a = {{{at_limit}}}}}\n@string{{s = a # {{{at_limit}}}}}\n{}",
         "@article{k, title = {T}, note = s}\n"
     );
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     assert_eq!(parsed.records.len(), 1);
     assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
 }
@@ -1690,11 +1695,655 @@ fn many_strings_parse_quickly() {
     }
     input.push_str("@article{a, title = {T}}\n");
     let start = std::time::Instant::now();
-    let parsed = parse(&input).unwrap();
+    let parsed = parse_hostile(&input);
     assert_eq!(parsed.records.len(), 1);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "{:?}",
         start.elapsed()
     );
+}
+
+// -- Hostile input: reference cycles --
+
+/// The diagnostics of `input`, which must parse.
+fn diagnostics_of(input: &str) -> Vec<Diagnostic> {
+    parse_hostile(input).diagnostics
+}
+
+/// The `crossref` each record kept, in order.
+fn crossrefs(parsed: &biblio::Parsed) -> Vec<Option<&str>> {
+    parsed
+        .records
+        .iter()
+        .map(|r| first_extra(r, "bibtex:crossref"))
+        .collect()
+}
+
+/// An entry whose `crossref` names itself, directly or through its own `ids` alias, keeps its
+/// fields but loses the `crossref`, and the cycle is reported.
+#[test]
+fn crossref_to_itself_removed() {
+    for input in [
+        "@article{a, title = {A}, crossref = {a}}\n",
+        "@article{a, title = {A}, ids = {x}, crossref = {x}}\n",
+    ] {
+        let parsed = parse_hostile(input);
+        assert_eq!(titles(&parsed), vec![Some("A")], "{input}");
+        assert_eq!(crossrefs(&parsed), vec![None], "{input}");
+        assert_eq!(
+            parsed.diagnostics,
+            vec![Diagnostic::ReferenceCycle { line: 1 }]
+        );
+    }
+}
+
+/// In a cycle between two entries, the reference that closes it is removed: the second entry's,
+/// because entries are searched in order.
+#[test]
+fn crossref_cycle_between_entries_broken() {
+    let parsed = parse_hostile(
+        "@article{a, title = {A}, crossref = {b}}\n@article{b, title = {B}, crossref = {a}}\n",
+    );
+    assert_eq!(crossrefs(&parsed), vec![Some("b"), None]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::ReferenceCycle { line: 2 }]
+    );
+}
+
+/// An `xdata` that refers back to its own entry is removed.
+#[test]
+fn xdata_cycle_broken() {
+    let parsed = parse_hostile(
+        "@xdata{d, note = {N}, xdata = {d}}\n@article{a, title = {A}, xdata = {d}}\n",
+    );
+    assert_eq!(parsed.records.len(), 2);
+    assert!(
+        parsed
+            .diagnostics
+            .contains(&Diagnostic::ReferenceCycle { line: 1 })
+    );
+}
+
+/// A cycle is found however the key is written: through a `@string`, or with LaTeX that the
+/// parser turns into the same key.
+#[test]
+fn cycles_found_through_strings_and_latex_in_keys() {
+    for input in [
+        "@string{k = {a}}\n@article{a, title = {A}, crossref = k}\n",
+        "@misc{a_b, title = {A}, crossref = {a\\_b}}\n",
+        "@misc{a\\b, title = {A}, crossref = {a\\\\b}}\n",
+        "@misc{a–b, title = {A}, crossref = {a--b}}\n",
+        "@misc{é, title = {A}, crossref = {\\'e}}\n",
+    ] {
+        let parsed = parse_hostile(input);
+        assert_eq!(parsed.records.len(), 1, "{input}");
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::ReferenceCycle { .. })),
+            "{input}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+/// A cycle hidden behind a duplicate field is still found, because the parser keeps the last of
+/// duplicate fields, and every copy of the field is removed.
+#[test]
+fn cycle_behind_duplicate_field_broken() {
+    let parsed = parse_hostile("@article{a, title = {A}, crossref = {x}, crossref = {a}}\n");
+    assert_eq!(crossrefs(&parsed), vec![None]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::ReferenceCycle { line: 1 }]
+    );
+}
+
+/// A later `ids` alias takes over an earlier key, as the parser resolves it, and a cycle through
+/// it is found.
+#[test]
+fn cycle_through_alias_taking_over_a_key_broken() {
+    let input = "\
+@article{a, title = {A}}
+@article{b, title = {B}, ids = {a}, crossref = {c}}
+@article{c, title = {C}, crossref = {a}}
+";
+    let parsed = parse_hostile(input);
+    assert_eq!(parsed.records.len(), 3);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::ReferenceCycle { line: 3 }]
+    );
+}
+
+/// A cycle between two entries on one line is broken when entries are parsed one by one, here
+/// forced by a broken entry.
+#[test]
+fn cycle_broken_when_parsing_entries_one_by_one() {
+    let input = concat!(
+        "@article{a, title = {A}, crossref = {b}} @article{b, title = {B}, crossref = {a}}\n",
+        "@article{c title = {C}}\n",
+    );
+    let parsed = parse_hostile(input);
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("B")]);
+    assert!(
+        parsed
+            .diagnostics
+            .contains(&Diagnostic::ReferenceCycle { line: 1 })
+    );
+}
+
+/// Only the entry whose reference closes a cycle loses it: entries leading into the cycle, and the
+/// rest of the cycle, keep their inheritance.
+#[test]
+fn chain_into_a_cycle_keeps_inheritance() {
+    let input = "\
+@book{a, title = {A}, publisher = {PubA}, crossref = {b}}
+@book{b, title = {B}, publisher = {PubB}, crossref = {a}}
+@incollection{c, title = {C}, crossref = {a}}
+";
+    let parsed = parse_hostile(input);
+    assert_eq!(crossrefs(&parsed), vec![Some("b"), None, Some("a")]);
+    assert_eq!(
+        first_extra(&parsed.records[2], "bibtex:publisher"),
+        Some("PubA")
+    );
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::ReferenceCycle { line: 2 }]
+    );
+}
+
+/// `@string` definitions that refer to themselves are removed, with every redefinition, and an
+/// entry using one is skipped; unused ones are reported too.
+#[test]
+fn string_cycles_removed() {
+    let parsed = parse_hostile("@string{p = q}\n@string{q = p}\n@article{a, title = p}\n");
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    let lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    assert_eq!(lines, vec![1, 2, 3]);
+
+    let parsed = parse_hostile("@string{p = p}\n@string{p = {x}}\n@article{a, title = p}\n");
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert!(matches!(
+        &parsed.diagnostics[0],
+        Diagnostic::SkippedEntry { line: 1, message }
+            if message.starts_with("@string p refers to itself")
+    ));
+
+    let unused = diagnostics_of("@string{p = p}\n@article{a, title = {A}}\n");
+    assert_eq!(unused.len(), 1);
+}
+
+/// A month `@string` that refers to itself is removed, and the month name is used instead.
+#[test]
+fn cyclic_month_string_falls_back_to_month() {
+    let parsed = parse_hostile("@string{jan = jan}\n@article{a, title = {A}, month = jan}\n");
+    assert_eq!(parsed.records[0].extras["bibtex:month"], vec!["January"]);
+}
+
+/// A chain of `@string`s longer than the limit, or one that doubles at each step, is removed from
+/// the point where it goes too far; shorter chains are kept. Doubling is judged by the look-ups it
+/// costs, not the text it produces.
+#[test]
+fn string_chains_bounded() {
+    let mut chain = String::from("@string{s0 = {x}}\n");
+    for i in 1..70 {
+        writeln!(chain, "@string{{s{i} = s{}}}", i - 1).unwrap();
+    }
+    chain.push_str("@article{a, title = {A}, note = s63}\n@article{b, title = {B}, note = s64}\n");
+    let parsed = parse_hostile(&chain);
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    assert_eq!(parsed.diagnostics[0].line(), 65);
+
+    let mut doubling = String::from("@string{a0 = {x}}\n");
+    for i in 1..26 {
+        writeln!(doubling, "@string{{a{i} = a{p} # a{p}}}", p = i - 1).unwrap();
+    }
+    doubling
+        .push_str("@article{a, title = {A}, note = a11}\n@article{b, title = {B}, note = a12}\n");
+    let parsed = parse_hostile(&doubling);
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    // `a11` costs 4,095 look-ups, within the limit; `a12` costs 8,191.
+    assert_eq!(parsed.diagnostics[0].line(), 13);
+}
+
+/// A `@string` cycle in a later part of the input is reported at its own lines when entries are
+/// parsed one by one.
+#[test]
+fn string_cycle_lines_on_the_per_entry_path() {
+    let input =
+        "@article{x title = {X}}\n@article{a, title = {A}}\n\n@string{p = q}\n@string{q = p}\n";
+    let lines: Vec<usize> = diagnostics_of(input).iter().map(Diagnostic::line).collect();
+    assert_eq!(lines, vec![1, 4, 5]);
+}
+
+/// Entries for a random reference graph: distinct keys, optional `ids` aliases (which may clash
+/// with each other but never with a key), and optional `crossref` and `xdata` targets naming keys
+/// or aliases.
+#[derive(Arbitrary, Debug)]
+struct ReferenceGraph {
+    /// For each entry: an alias, a `crossref` target and `xdata` targets, as indexes into
+    /// [`REFERENCE_NAMES`].
+    #[strategy(vec((
+        proptest::option::of(0_usize..4),
+        proptest::option::of(0_usize..12),
+        vec(0_usize..12, 0..3),
+    ), 1..=8))]
+    entries: Vec<(Option<usize>, Option<usize>, Vec<usize>)>,
+}
+
+/// Names in a random reference graph: eight keys, then four aliases.
+const REFERENCE_NAMES: [&str; 12] = [
+    "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "x0", "x1", "x2", "x3",
+];
+
+/// Whether `start` can reach itself in the graph `edges`.
+fn reaches_itself(start: usize, edges: &[Vec<usize>]) -> bool {
+    let mut seen = vec![false; edges.len()];
+    let mut stack: Vec<usize> = edges[start].clone();
+    while let Some(node) = stack.pop() {
+        if node == start {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[node], true) {
+            stack.extend(&edges[node]);
+        }
+    }
+    false
+}
+
+/// However entries refer to each other, parsing never aborts; no `crossref` cycle is left; an entry
+/// on no cycle keeps its `crossref`; and each entry that lost a reference is reported once.
+#[proptest]
+fn reference_graphs_never_abort(input: ReferenceGraph) {
+    let mut source = String::new();
+    for (index, (alias, crossref, xdata)) in input.entries.iter().enumerate() {
+        write!(source, "@misc{{k{index}, title = {{T}}").unwrap();
+        if let Some(alias) = alias {
+            write!(source, ", ids = {{{}}}", REFERENCE_NAMES[8 + alias]).unwrap();
+        }
+        if let Some(target) = crossref {
+            write!(source, ", crossref = {{{}}}", REFERENCE_NAMES[*target]).unwrap();
+        }
+        if !xdata.is_empty() {
+            let names: Vec<&str> = xdata.iter().map(|&t| REFERENCE_NAMES[t]).collect();
+            write!(source, ", xdata = {{{}}}", names.join(", ")).unwrap();
+        }
+        source.push_str("}\n");
+    }
+    let parsed = parse_hostile(&source);
+    prop_assert_eq!(parsed.records.len(), input.entries.len());
+
+    // Resolve names as the parser does: keys first, then each alias, a later one overwriting.
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for (index, (alias, _, _)) in input.entries.iter().enumerate() {
+        by_name.insert(REFERENCE_NAMES[index], index);
+        if let Some(alias) = alias {
+            by_name.insert(REFERENCE_NAMES[8 + alias], index);
+        }
+    }
+    let resolve = |name: &str| by_name.get(name).copied();
+    let all_edges: Vec<Vec<usize>> = input
+        .entries
+        .iter()
+        .map(|(_, crossref, xdata)| {
+            crossref
+                .iter()
+                .chain(xdata)
+                .filter_map(|&t| resolve(REFERENCE_NAMES[t]))
+                .collect()
+        })
+        .collect();
+    let kept_crossrefs: Vec<Vec<usize>> = parsed
+        .records
+        .iter()
+        .map(|r| {
+            first_extra(r, "bibtex:crossref")
+                .and_then(resolve)
+                .into_iter()
+                .collect()
+        })
+        .collect();
+
+    for index in 0..input.entries.len() {
+        prop_assert!(!reaches_itself(index, &kept_crossrefs));
+        if !reaches_itself(index, &all_edges) {
+            prop_assert_eq!(
+                first_extra(&parsed.records[index], "bibtex:crossref"),
+                input.entries[index].1.map(|t| REFERENCE_NAMES[t])
+            );
+        }
+    }
+    let lost = input
+        .entries
+        .iter()
+        .zip(&parsed.records)
+        .filter(|((_, crossref, _), record)| {
+            crossref.is_some() && first_extra(record, "bibtex:crossref").is_none()
+        })
+        .count();
+    let reported = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::ReferenceCycle { .. }))
+        .count();
+    prop_assert!(lost <= reported);
+    let mut reported_lines = HashSet::new();
+    for diagnostic in &parsed.diagnostics {
+        if let Diagnostic::ReferenceCycle { line } = diagnostic {
+            prop_assert!(reaches_itself(line - 1, &all_edges), "line {line}");
+            prop_assert!(reported_lines.insert(*line), "line {line} reported twice");
+        }
+    }
+}
+
+/// Random `@string` definitions that use each other, with text, empty or month-name leaves and
+/// redefinitions: parsing never aborts, and every name reported as referring to itself is on a
+/// cycle.
+#[proptest]
+fn string_graphs_never_abort(
+    #[strategy(vec(vec(0_usize..6, 0..3), 1..=6))] definitions: Vec<Vec<usize>>,
+    #[strategy(proptest::sample::select(vec!["{x}", "{}", "\"\"", "jan"]))] leaf: &'static str,
+    redefine: bool,
+) {
+    let mut source = String::new();
+    for (index, uses) in definitions.iter().enumerate() {
+        let mut parts: Vec<String> = uses.iter().map(|u| format!("s{u}")).collect();
+        parts.push(leaf.to_owned());
+        writeln!(source, "@string{{s{index} = {}}}", parts.join(" # ")).unwrap();
+    }
+    if redefine {
+        // Later definitions are never used, so they must not change the outcome.
+        source.push_str("@string{s0 = {later}}\n");
+    }
+    for index in 0..definitions.len() {
+        writeln!(source, "@misc{{k{index}, title = {{T}}, note = s{index}}}").unwrap();
+    }
+    let parsed = parse_hostile(&source);
+
+    let edges: Vec<Vec<usize>> = definitions
+        .iter()
+        .map(|uses| {
+            uses.iter()
+                .copied()
+                .filter(|&u| u < definitions.len())
+                .collect()
+        })
+        .collect();
+    let cyclic = parsed.diagnostics.iter().filter_map(|d| match d {
+        Diagnostic::SkippedEntry { message, .. } => message
+            .strip_prefix("@string s")
+            .and_then(|rest| rest.split_once(" refers to itself"))
+            .map(|(index, _)| index.parse::<usize>().unwrap()),
+        _ => None,
+    });
+    for index in cyclic {
+        prop_assert!(reaches_itself(index, &edges), "s{index}");
+    }
+}
+
+// -- Hostile input: resolution work --
+
+/// A `@string` chain that doubles at each step: `a0 = leaf`, `a_i = a_{i-1} # a_{i-1}`.
+fn doubling_strings(leaf: &str, levels: usize) -> String {
+    let mut source = format!("@string{{a0 = {leaf}}}\n");
+    for i in 1..=levels {
+        writeln!(source, "@string{{a{i} = a{p} # a{p}}}", p = i - 1).unwrap();
+    }
+    source
+}
+
+/// A doubling chain of empty values is bounded by the look-ups it costs, even though it produces no
+/// text. Regression test from code review: it used to run for minutes.
+#[test]
+fn empty_doubling_strings_bounded() {
+    for leaf in ["{}", "\"\""] {
+        let mut input = doubling_strings(leaf, 59);
+        input.push_str(
+            "@article{a, title = {A}, note = a59}\n@article{b, title = {B}, note = a11}\n",
+        );
+        let parsed = parse_hostile(&input);
+        assert_eq!(titles(&parsed), vec![Some("B")], "{leaf}");
+    }
+}
+
+/// Uses of `@string`s draw on one budget for the whole input: once it runs out, further entries
+/// that use them are skipped and reported, and the entries before are kept. Uses in `ids`,
+/// `crossref` and `xdata` count twice.
+#[test]
+fn string_use_budget_shared_by_the_input() {
+    // `a11` costs 4,095 look-ups, so the budget of 4,194,304 covers 1,024 uses.
+    let mut input = doubling_strings("{x}", 11);
+    for i in 0..1_100 {
+        writeln!(input, "@article{{e{i}, title = {{T}}, note = a11}}").unwrap();
+    }
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 1_024);
+    assert!(matches!(
+        &parsed.diagnostics[0],
+        Diagnostic::SkippedEntry { line: 1_037, message }
+            if message == "uses @string definitions that expand too far in total"
+    ));
+
+    let mut twice = doubling_strings("{x}", 11);
+    for i in 0..600 {
+        writeln!(twice, "@article{{e{i}, title = {{T}}, ids = a11}}").unwrap();
+    }
+    assert_eq!(parse_hostile(&twice).records.len(), 512);
+}
+
+/// The budget is shared across the input when entries are parsed one by one, here forced by a
+/// broken entry, so splitting the input does not multiply it.
+#[test]
+fn string_use_budget_shared_when_parsing_entries_one_by_one() {
+    let mut input = doubling_strings("{x}", 11);
+    input.push_str("@article{broken title = {X}}\n");
+    for i in 0..1_100 {
+        writeln!(input, "@article{{e{i}, title = {{T}}, note = a11}}").unwrap();
+    }
+    assert_eq!(parse_hostile(&input).records.len(), 1_024);
+}
+
+/// Reference fields are recognised in any case.
+#[test]
+fn reference_fields_in_any_case_checked() {
+    for input in [
+        "@article{a, title = {A}, CROSSREF = {a}}\n",
+        "@xdata{a, title = {A}, XData = {a}}\n",
+    ] {
+        assert_eq!(
+            diagnostics_of(input),
+            vec![Diagnostic::ReferenceCycle { line: 1 }],
+            "{input}"
+        );
+    }
+}
+
+/// An `xdata` that closes a cycle is removed in full, so its other keys go too.
+#[test]
+fn cyclic_xdata_removed_in_full() {
+    let input = "\
+@xdata{z, title = {Z}, publisher = {PubZ}}
+@book{a, title = {A}, xdata = {z, a}}
+";
+    let parsed = parse_hostile(input);
+    assert_eq!(first_extra(&parsed.records[1], "bibtex:publisher"), None);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::ReferenceCycle { line: 2 }]
+    );
+}
+
+/// A cycle between two `@xdata` entries is broken, and an entry using them still parses.
+#[test]
+fn xdata_entries_on_a_cycle_broken() {
+    let input = "\
+@xdata{d, note = {N}, xdata = {e}}
+@xdata{e, note = {M}, xdata = {d}}
+@article{a, title = {A}, xdata = {d}}
+";
+    let parsed = parse_hostile(input);
+    assert_eq!(parsed.records.len(), 3);
+    assert_eq!(
+        parsed
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ReferenceCycle { .. }))
+            .count(),
+        1
+    );
+}
+
+/// An `ids` alias equal to the entry's own key is a self-reference like any other.
+#[test]
+fn alias_equal_to_own_key_checked() {
+    assert_eq!(
+        diagnostics_of("@article{a, title = {A}, ids = {a}, crossref = {a}}\n"),
+        vec![Diagnostic::ReferenceCycle { line: 1 }]
+    );
+}
+
+/// A `crossref` given by a `@string` that was removed fails like any unknown abbreviation, and a
+/// self-reference elsewhere in the input is still broken.
+#[test]
+fn crossref_through_removed_string_skipped() {
+    let input = "\
+@string{p = p}
+@article{a, title = {A}, crossref = p}
+@article{b, title = {B}, crossref = {b}}
+";
+    let parsed = parse_hostile(input);
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    assert!(
+        parsed
+            .diagnostics
+            .contains(&Diagnostic::ReferenceCycle { line: 3 })
+    );
+}
+
+/// Entries whose `ids` aliases may equal other entries' keys, which makes the whole input fail at
+/// once and parse entry by entry, never abort the parse.
+#[proptest]
+fn reference_graphs_with_key_clashes_never_abort(
+    #[strategy(vec((
+        proptest::option::of(0_usize..12),
+        proptest::option::of(0_usize..12),
+        vec(0_usize..12, 0..3),
+    ), 1..=8))]
+    entries: Vec<(Option<usize>, Option<usize>, Vec<usize>)>,
+) {
+    let mut source = String::new();
+    for (index, (alias, crossref, xdata)) in entries.iter().enumerate() {
+        write!(source, "@misc{{k{index}, title = {{T}}").unwrap();
+        if let Some(alias) = alias {
+            write!(source, ", ids = {{{}}}", REFERENCE_NAMES[*alias]).unwrap();
+        }
+        if let Some(target) = crossref {
+            write!(source, ", crossref = {{{}}}", REFERENCE_NAMES[*target]).unwrap();
+        }
+        if !xdata.is_empty() {
+            let names: Vec<&str> = xdata.iter().map(|&t| REFERENCE_NAMES[t]).collect();
+            write!(source, ", xdata = {{{}}}", names.join(", ")).unwrap();
+        }
+        source.push_str("}\n");
+    }
+    let parsed = parse_hostile(&source);
+    prop_assert!(parsed.records.len() <= entries.len());
+}
+
+/// Looking up a `@string` among many definitions is charged by the definitions the input uses,
+/// not all of them: many unused definitions neither slow parsing down nor make entries be
+/// skipped. Regression test from code review: the parser scans its list of definitions for every
+/// look-up.
+#[test]
+fn many_unused_strings_do_not_cost_look_ups() {
+    let mut input = String::new();
+    for i in 0..10_000 {
+        writeln!(input, "@string{{f{i} = {{x}}}}").unwrap();
+    }
+    input.push_str(&doubling_strings("{x}", 11));
+    for i in 0..32 {
+        let uses = vec!["a11"; 32].join(" # ");
+        writeln!(input, "@article{{e{i}, title = {{T}}, note = {uses}}}").unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 32);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// Entries parsed one by one each get only the `@string` definitions they use, so many
+/// definitions and many entries together stay fast.
+#[test]
+fn many_strings_and_entries_parse_quickly_one_by_one() {
+    let mut input = String::new();
+    for i in 0..5_000 {
+        writeln!(input, "@string{{f{i} = {{x}}}}").unwrap();
+    }
+    input.push_str("@article{broken title}\n");
+    for i in 0..5_000 {
+        writeln!(
+            input,
+            "@article{{e{i}, title = {{T}}, crossref = {{e{i}}}}}"
+        )
+        .unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records.len(), 5_000);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// A use of a month `@string` that was removed for referring to itself still costs a look-up,
+/// because the month name stands in for it, so a chain of such uses is bounded. Regression test
+/// from code review: the uses were counted as free and the input ran without limit.
+#[test]
+fn uses_of_removed_month_strings_cost_look_ups() {
+    let mut input = String::from("@string{jan = jan}\n");
+    writeln!(input, "@string{{v0 = {}}}", vec!["jan"; 2_000].join(" # ")).unwrap();
+    for i in 1..=11 {
+        writeln!(input, "@string{{v{i} = v{p} # v{p}}}", p = i - 1).unwrap();
+    }
+    for i in 0..10 {
+        writeln!(input, "@article{{e{i}, title = {{T}}, note = v11}}").unwrap();
+    }
+    let start = std::time::Instant::now();
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// A `@string` whose name is longer than 64 bytes is dropped, because comparing long names makes
+/// every look-up slow; shorter names are kept.
+#[test]
+fn long_string_names_dropped() {
+    let long = "n".repeat(65);
+    let short = "n".repeat(64);
+    let input = format!(
+        "@string{{{long} = {{x}}}}\n@string{{{short} = {{y}}}}\n{}",
+        format_args!("@misc{{a, title = {{A}}, note = {short}}}\n")
+    );
+    let parsed = parse_hostile(&input);
+    assert_eq!(parsed.records[0].extras["bibtex:note"], vec!["y"]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, message }]
+            if message == "@string with a name longer than 64 bytes"
+    ));
 }

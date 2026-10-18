@@ -53,6 +53,15 @@ pub enum Diagnostic {
         message: String,
     },
 
+    /// A `BibTeX` entry's `crossref` or `xdata` led back to the entry itself, directly or through
+    /// other entries or `ids` aliases. That field was removed in full, so the entry inherits
+    /// nothing through it, and an `xdata` listing several entries loses all of them. The entry is
+    /// kept.
+    ReferenceCycle {
+        /// Line where the entry starts.
+        line: usize,
+    },
+
     /// The input broke off: an `EndNote XML` syntax error, or the end of the input inside a record.
     /// The records before it are kept, the record in progress is dropped, and parsing stops.
     Truncated {
@@ -71,6 +80,7 @@ impl Diagnostic {
             Self::MissingTitle { line }
             | Self::UnterminatedRecord { line }
             | Self::IgnoredLine { line }
+            | Self::ReferenceCycle { line }
             | Self::SkippedEntry { line, .. }
             | Self::Truncated { line, .. } => *line,
         }
@@ -87,6 +97,12 @@ impl fmt::Display for Diagnostic {
             Self::IgnoredLine { line } => write!(f, "ignored line {line}"),
             Self::SkippedEntry { line, message } => {
                 write!(f, "skipped entry at line {line}: {message}")
+            }
+            Self::ReferenceCycle { line } => {
+                write!(
+                    f,
+                    "reference cycle at line {line}: crossref or xdata removed"
+                )
             }
             Self::Truncated { line, message } => {
                 write!(f, "input truncated at line {line}: {message}")
