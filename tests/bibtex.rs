@@ -1438,3 +1438,263 @@ fn records_stable_through_serialize(
     let second = parse(&serialize(&first.records)).unwrap().records;
     prop_assert_eq!(second, first.records);
 }
+
+// -- Hostile input: nesting --
+
+/// The deepest brace nesting the parser accepts in a value; a copy of the parser's limit.
+const MAX_NESTING: usize = 128;
+
+/// A command argument nested `depth` levels deep, such as `\x{\x{x}}` for depth 2.
+fn nested_commands(depth: usize) -> String {
+    format!("{}x{}", "\\x{".repeat(depth), "}".repeat(depth))
+}
+
+/// A value nested exactly at the limit is read; one level deeper, the entry is skipped and
+/// reported, and the other entries are kept.
+#[test]
+fn nesting_at_limit_kept_beyond_skipped() {
+    let at_limit = nested_commands(MAX_NESTING);
+    let parsed = parse(&format!(
+        "@article{{a, title = {{T}}, note = {{{at_limit}}}}}\n"
+    ))
+    .unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+
+    let beyond = nested_commands(MAX_NESTING + 1);
+    let input = format!("@article{{a, title = {{A}}}}\n@article{{b, note = {{{beyond}}}}}\n");
+    let parsed = parse(&input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("A")]);
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 2, message }] if message == "fields nested too deeply"
+    ));
+}
+
+/// Deep nesting is also caught when entries are parsed one by one, here forced by a broken entry
+/// and with two entries on one line.
+#[test]
+fn nesting_caught_when_parsing_entries_one_by_one() {
+    let beyond = nested_commands(MAX_NESTING + 1);
+    let input = format!(
+        "@article{{a, note = {{{beyond}}}}} @article{{b, title = {{B}}}}\n{}",
+        "@article{c title = {C}}\n"
+    );
+    let parsed = parse(&input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    let lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    assert_eq!(lines, vec![1, 2]);
+}
+
+/// Plain groups and quoted values with unbalanced braces count too, so they are skipped beyond
+/// the limit.
+#[test]
+fn deep_groups_and_quoted_braces_skipped() {
+    let groups = format!(
+        "{}x{}",
+        "{".repeat(MAX_NESTING + 1),
+        "}".repeat(MAX_NESTING + 1)
+    );
+    let quoted = "{".repeat(MAX_NESTING + 1);
+    for value in [format!("{{{groups}}}"), format!("\"{quoted}\"")] {
+        let parsed = parse(&format!("@article{{a, note = {value}}}\n")).unwrap();
+        assert_eq!(parsed.records, Vec::<Record>::new(), "{value}");
+        assert!(
+            matches!(
+                parsed.diagnostics.as_slice(),
+                [Diagnostic::SkippedEntry { line: 1, message }]
+                    if message == "fields nested too deeply"
+            ),
+            "{value}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+/// A deeply nested `crossref` value is skipped like any other field.
+#[test]
+fn deep_crossref_value_skipped() {
+    let beyond = nested_commands(MAX_NESTING + 1);
+    let parsed = parse(&format!("@article{{a, crossref = {{{beyond}}}}}\n")).unwrap();
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert!(matches!(
+        parsed.diagnostics.as_slice(),
+        [Diagnostic::SkippedEntry { line: 1, .. }]
+    ));
+}
+
+/// A `@string` whose first definition nests too deeply is removed, with every later definition of
+/// the same name, and the entry that uses it is skipped.
+#[test]
+fn deep_string_removed_with_its_redefinitions() {
+    let beyond = nested_commands(MAX_NESTING + 1);
+    let input = format!(
+        "@string{{s = {{{beyond}}}}}\n{}",
+        "@string{s = {shallow}}\n@article{a, title = s}\n@article{b, title = {B}}\n"
+    );
+    let parsed = parse(&input).unwrap();
+    assert_eq!(titles(&parsed), vec![Some("B")]);
+    let reported: Vec<(usize, String)> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| match d {
+            Diagnostic::SkippedEntry { line, message } => (*line, message.clone()),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        reported[0],
+        (1, "@string s is nested too deeply".to_owned())
+    );
+    assert_eq!(reported[1].0, 3);
+    assert_eq!(reported.len(), 2);
+}
+
+/// Values at the nesting limit, reached through a long chain of `@string`s, parse on a test
+/// thread's default stack.
+#[test]
+fn nesting_limit_fits_on_a_test_thread() {
+    let mut input = format!("@string{{s0 = {{{}}}}}\n", nested_commands(MAX_NESTING));
+    for i in 1..64 {
+        writeln!(input, "@string{{s{i} = s{}}}", i - 1).unwrap();
+    }
+    input.push_str("@article{a, title = {T}, note = s63}\n");
+    // A thread of the size test threads get by default, set explicitly so that settings such as
+    // `RUST_MIN_STACK` cannot hide a shrinking margin.
+    let records = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || parse(&input).unwrap().records.len())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(records, 1);
+}
+
+/// Command arguments nested 10,000 deep are skipped rather than overflowing the stack.
+#[test]
+fn very_deep_nesting_skipped() {
+    let parsed = parse(&format!(
+        "@article{{a, title = {{{}}}}}\n",
+        nested_commands(10_000)
+    ))
+    .unwrap();
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert_eq!(parsed.diagnostics.len(), 1);
+}
+
+/// Pieces of deeply nested LaTeX: command arguments, groups, escaped braces, maths and letters.
+fn arb_nesting_piece() -> impl Strategy<Value = &'static str> {
+    proptest::sample::select(vec!["\\x{", "{", "}", "\\{", "$", "a"])
+}
+
+/// The deepest brace nesting in `text`, counted as the parser's guard counts it: every `{` and `}`,
+/// never below zero. A copy of the parser's rule, so that the tests pin it.
+fn brace_depth(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0_usize, 0);
+    for c in text.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// Any mixture of commands, groups and braces, nested up to twice the limit, parses without
+/// overflowing the stack.
+#[proptest]
+fn nesting_never_aborts(
+    #[strategy(proptest::collection::vec(arb_nesting_piece(), 0..2 * MAX_NESTING * 2))] pieces: Vec<
+        &'static str,
+    >,
+) {
+    let value: String = pieces.concat();
+    let input = format!("@article{{a, title = {{T}}, note = {{{value}}}}}\n");
+    prop_assert!(parse(&input).is_ok());
+}
+
+/// A well-formed value made of commands, groups, maths and letters, with every brace closed, up to
+/// twice the limit deep.
+fn arb_balanced_value() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        proptest::sample::select(vec!["\\x{", "{", "}", "$a$", "a"]),
+        0..4 * MAX_NESTING,
+    )
+    .prop_map(|pieces| {
+        let mut value = String::new();
+        let mut open = 0_usize;
+        for piece in pieces {
+            if piece == "}" {
+                if open == 0 {
+                    continue;
+                }
+                open -= 1;
+            } else if piece.ends_with('{') {
+                open += 1;
+            }
+            value.push_str(piece);
+        }
+        value.push_str(&"}".repeat(open));
+        value
+    })
+}
+
+/// A well-formed value is skipped exactly when its braces nest deeper than the limit.
+#[proptest]
+fn deep_values_skipped_exactly(#[strategy(arb_balanced_value())] value: String) {
+    let input = format!("@article{{a, title = {{T}}, note = {{{value}}}}}\n");
+    let parsed = parse(&input).unwrap();
+    let too_deep = brace_depth(&value) > MAX_NESTING;
+    prop_assert_eq!(parsed.records.is_empty(), too_deep);
+    prop_assert_eq!(parsed.diagnostics.len(), usize::from(too_deep));
+}
+
+/// A deep `@string` in a later part of the input is reported at its own line when entries are
+/// parsed one by one.
+#[test]
+fn deep_string_line_on_the_per_entry_path() {
+    let beyond = nested_commands(MAX_NESTING + 1);
+    let input = format!(
+        "@article{{x title = {{X}}}}\n@article{{a, title = {{A}}}}\n\n@string{{s = {{{beyond}}}}}\n"
+    );
+    let parsed = parse(&input).unwrap();
+    let lines: Vec<usize> = parsed.diagnostics.iter().map(Diagnostic::line).collect();
+    assert_eq!(lines, vec![1, 4]);
+}
+
+/// In a concatenated `@string`, each part is judged on its own, because the parser parses each
+/// part separately: two parts at the limit together are fine.
+#[test]
+fn concatenated_string_parts_judged_separately() {
+    let at_limit = nested_commands(MAX_NESTING);
+    let input = format!(
+        "@string{{a = {{{at_limit}}}}}\n@string{{s = a # {{{at_limit}}}}}\n{}",
+        "@article{k, title = {T}, note = s}\n"
+    );
+    let parsed = parse(&input).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// Many `@string` definitions are checked in linear time. Regression test from code review: the
+/// check once compared every name with every other.
+#[test]
+fn many_strings_parse_quickly() {
+    let mut input = String::new();
+    for i in 0..40_000 {
+        writeln!(input, "@string{{s{i} = {{x}}}}").unwrap();
+    }
+    input.push_str("@article{a, title = {T}}\n");
+    let start = std::time::Instant::now();
+    let parsed = parse(&input).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
