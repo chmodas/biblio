@@ -40,6 +40,19 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///   is skipped, or falls back to the month for a month name. A `crossref` to a skipped entry
 ///   inherits nothing.
 ///
+///   `@string` definitions that refer to themselves, directly or through others, are dropped the
+///   same way, unused ones included, and so are those whose chain of definitions is longer than
+///   64, or whose use would cost more than 4,096 look-ups or expand to more than 1 MiB. Across
+///   the input, the uses of `@string`s may cost at most about 4 million look-ups, half a billion
+///   comparisons while finding definitions, and 32 MiB of text; an entry that would go over that
+///   is skipped. `@string` names longer than 64 bytes are dropped too. If the whole input cannot
+///   be read at once, entries are read again one by one with a fresh budget, so the work is
+///   bounded by twice the budget. Real files stay far below these limits, but a very large file
+///   that uses thousands of different `@string`s may have its later entries skipped.
+/// - [`Diagnostic::ReferenceCycle`]: an entry's `crossref` or `xdata` led back to itself,
+///   directly, through other entries or through `ids` aliases. Entries are searched in order, and
+///   the field whose reference closes the cycle is removed in full; the entry is kept.
+///
 /// The whole input is first parsed at once, which resolves `@string` macros and `crossref`
 /// inheritance. If that fails, the input is split into entries at lines starting with `@type{` or
 /// `@type(` and each entry is parsed on its own, with the `@string` macros of every entry that
@@ -104,8 +117,18 @@ fn parse_whole(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Dia
         .map(|pair| pair.key.span.start)
         .collect();
     let mut string_lines = lines_of(input, &string_offsets);
-    guard::strings(&mut raw.abbreviations, &mut string_lines, diagnostics);
-    guard::entries(&mut raw.entries, &mut lines, diagnostics);
+    let mut strings = guard::strings(&mut raw.abbreviations, &mut string_lines, diagnostics);
+    strings.plan(&raw.entries);
+    let mut budget = guard::Budget::default();
+    guard::entries(
+        &mut raw.entries,
+        &mut lines,
+        &strings,
+        &mut budget,
+        diagnostics,
+    );
+    raw.abbreviations = strings.needed(&raw.abbreviations, &raw.entries);
+    guard::references(&mut raw, &lines, diagnostics);
     let Ok(bibliography) = Bibliography::from_raw(raw) else {
         return false;
     };
@@ -145,19 +168,24 @@ fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<D
         }
     }
 
-    guard::strings(&mut abbreviations, &mut string_lines, diagnostics);
+    let mut strings = guard::strings(&mut abbreviations, &mut string_lines, diagnostics);
+    strings.plan(chunks.iter().flat_map(|(_, entries)| entries));
+    // One budget for the whole input, however it is split.
+    let mut budget = guard::Budget::default();
 
     for (line, mut entries) in chunks {
         let mut lines = vec![line; entries.len()];
-        guard::entries(&mut entries, &mut lines, diagnostics);
+        guard::entries(&mut entries, &mut lines, &strings, &mut budget, diagnostics);
         if entries.is_empty() {
             continue;
         }
-        let raw = RawBibliography {
+        let needed = strings.needed(&abbreviations, &entries);
+        let mut raw = RawBibliography {
             preamble: String::new(),
             entries,
-            abbreviations: abbreviations.clone(),
+            abbreviations: needed,
         };
+        guard::references(&mut raw, &lines, diagnostics);
         match Bibliography::from_raw(raw) {
             Ok(bibliography) => {
                 for entry in bibliography.iter() {
