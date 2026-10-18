@@ -8,6 +8,8 @@
 //! - [BibTeX format](https://www.bibtex.com/g/bibtex-format/)
 //! - [`BibLaTeX` guide](https://www.overleaf.com/learn/latex/Bibliography_management_with_biblatex)
 
+mod guard;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -31,7 +33,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///
 /// - [`Diagnostic::MissingTitle`]: an entry has no `title`, or only a blank one.
 /// - [`Diagnostic::SkippedEntry`]: an entry or `@string` definition could not be parsed and was
-///   dropped.
+///   dropped. This includes values whose braces nest more than 128 deep, which would overflow the
+///   stack: the nesting of every `{` and `}` is counted, plain groups and escaped braces included,
+///   in every field, verbatim ones such as `url` too.
+///   When a `@string` is dropped, every definition of that name goes with it, and an entry using it
+///   is skipped, or falls back to the month for a month name. A `crossref` to a skipped entry
+///   inherits nothing.
 ///
 /// The whole input is first parsed at once, which resolves `@string` macros and `crossref`
 /// inheritance. If that fails, the input is split into entries at lines starting with `@type{` or
@@ -86,16 +93,24 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// Parse the whole input at once. Returns `false`, leaving partial results behind, if any entry
 /// fails to parse or resolve.
 fn parse_whole(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Diagnostic>) -> bool {
-    let Ok(raw) = RawBibliography::parse(input) else {
+    let Ok(mut raw) = RawBibliography::parse(input) else {
         return false;
     };
-    let offsets: Vec<usize> = raw.entries.iter().map(|entry| entry.span.start).collect();
+    let entry_offsets: Vec<usize> = raw.entries.iter().map(|entry| entry.span.start).collect();
+    let mut lines = lines_of(input, &entry_offsets);
+    let string_offsets: Vec<usize> = raw
+        .abbreviations
+        .iter()
+        .map(|pair| pair.key.span.start)
+        .collect();
+    let mut string_lines = lines_of(input, &string_offsets);
+    guard::strings(&mut raw.abbreviations, &mut string_lines, diagnostics);
+    guard::entries(&mut raw.entries, &mut lines, diagnostics);
     let Ok(bibliography) = Bibliography::from_raw(raw) else {
         return false;
     };
     // `from_raw` keeps the raw entries one-for-one and in order (it rejects a duplicate key rather
-    // than replacing an entry), so each entry lines up with its offset.
-    let lines = lines_of(input, &offsets);
+    // than replacing an entry), so each entry lines up with its line.
     for (entry, line) in bibliography.iter().zip(lines) {
         records.push(record_from_entry(entry, line, diagnostics));
     }
@@ -108,10 +123,18 @@ fn parse_whole(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Dia
 /// are known; then each chunk's entries are resolved with all of those macros.
 fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Diagnostic>) {
     let mut abbreviations = Vec::new();
+    let mut string_lines = Vec::new();
     let mut chunks: Vec<(usize, Vec<Spanned<RawEntry<'_>>>)> = Vec::new();
     for (line, chunk) in split_entries(input) {
         match RawBibliography::parse(chunk) {
             Ok(raw) => {
+                // Spans are relative to the chunk.
+                let offsets: Vec<usize> = raw
+                    .abbreviations
+                    .iter()
+                    .map(|pair| pair.key.span.start)
+                    .collect();
+                string_lines.extend(lines_of(chunk, &offsets).into_iter().map(|l| line + l - 1));
                 abbreviations.extend(raw.abbreviations);
                 chunks.push((line, raw.entries));
             }
@@ -122,7 +145,11 @@ fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<D
         }
     }
 
-    for (line, entries) in chunks {
+    guard::strings(&mut abbreviations, &mut string_lines, diagnostics);
+
+    for (line, mut entries) in chunks {
+        let mut lines = vec![line; entries.len()];
+        guard::entries(&mut entries, &mut lines, diagnostics);
         if entries.is_empty() {
             continue;
         }
