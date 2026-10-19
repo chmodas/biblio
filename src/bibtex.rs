@@ -85,8 +85,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// is first read. A `crossref` child's extras include the fields it inherits, and `crossref` itself
 /// is kept; `xdata` is consumed while resolving and is not kept. A field that appears twice keeps
 /// its last value. Fields that are read but lose to another are dropped: `issn` when `isbn` is
-/// present, `journal` when `journaltitle` is present, `year` when `date` is present, and values of
-/// `year` or `author` that cannot be read.
+/// present, `journal` when `journaltitle` is present, and values of `date`, `year` or `author`
+/// that cannot be read. The date comes from `date` when it gives one, and from `year` otherwise,
+/// so a readable `year` is dropped only when `date` can be read; a blank or unreadable `date`
+/// falls back to `year`. A `crossref` child of a type that inherits its parent's date, such as an
+/// `inproceedings` of a `proceedings`, takes the parent's date, and the underlying parser drops the
+/// child's own `year` while resolving, even when the parent's `date` cannot be read.
 ///
 /// # Identifiers
 ///
@@ -599,42 +603,46 @@ fn format_person(person: &Person) -> String {
     parts
 }
 
-/// Extract a [`PublicationDate`] from a biblatex entry.
-///
-/// Tries the `date` field first (ISO 8601 or free-text). Falls back to the `year` field. The
-/// biblatex crate uses 0-indexed month and day internally, so both are incremented by 1 before
-/// storing.
+/// Extract a [`PublicationDate`] from a biblatex entry: from the `date` field if it gives one,
+/// otherwise from the `year` field, so a blank or unreadable `date` does not hide a usable `year`.
 fn parse_date(entry: &biblatex::Entry) -> Option<PublicationDate> {
-    if let Ok(date) = entry.get_as::<PermissiveType<Date>>("date") {
-        return match date {
-            PermissiveType::Typed(d) => {
-                let dt = match d.value {
-                    DateValue::At(dt)
-                    | DateValue::After(dt)
-                    | DateValue::Before(dt)
-                    | DateValue::Between(dt, _) => dt,
-                };
-                // biblatex uses 0-indexed month and day.
-                Some(PublicationDate {
-                    year: dt.year,
-                    month: dt.month.map(|m| m + 1),
-                    day: dt.day.map(|d| d + 1),
-                })
-            }
-            PermissiveType::Chunks(c) => {
-                let s = c.format_verbatim();
-                let year = s.split_whitespace().next()?.parse().ok()?;
-                Some(PublicationDate {
-                    year,
-                    month: None,
-                    day: None,
-                })
-            }
-        };
-    }
+    date_field(entry).or_else(|| year_field(entry))
+}
 
-    let year_str = entry.get("year")?.format_verbatim();
-    let year = year_str.trim().parse().ok()?;
+/// The date the `date` field gives: an ISO 8601 date; the start of a range, or its end when the
+/// range is open at the start; or the year that free text starts with. The biblatex crate uses
+/// 0-indexed month and day internally, so both are incremented by 1 before storing.
+fn date_field(entry: &biblatex::Entry) -> Option<PublicationDate> {
+    match entry.get_as::<PermissiveType<Date>>("date").ok()? {
+        PermissiveType::Typed(d) => {
+            let dt = match d.value {
+                DateValue::At(dt)
+                | DateValue::After(dt)
+                | DateValue::Before(dt)
+                | DateValue::Between(dt, _) => dt,
+            };
+            // biblatex uses 0-indexed month and day.
+            Some(PublicationDate {
+                year: dt.year,
+                month: dt.month.map(|m| m + 1),
+                day: dt.day.map(|d| d + 1),
+            })
+        }
+        PermissiveType::Chunks(c) => {
+            let s = c.format_verbatim();
+            let year = s.split_whitespace().next()?.parse().ok()?;
+            Some(PublicationDate {
+                year,
+                month: None,
+                day: None,
+            })
+        }
+    }
+}
+
+/// The year the `year` field gives, if it is a number.
+fn year_field(entry: &biblatex::Entry) -> Option<PublicationDate> {
+    let year = entry.get("year")?.format_verbatim().trim().parse().ok()?;
     Some(PublicationDate {
         year,
         month: None,

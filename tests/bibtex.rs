@@ -265,6 +265,116 @@ fn date_without_year_ignored() {
     }
 }
 
+/// A `date` that cannot be read falls back to the `year`, including one that starts with digits
+/// but is no date and does not start with a year on its own; neither field is kept in the extras.
+#[test]
+fn unreadable_date_falls_back_to_year() {
+    let dates = [
+        "",
+        " ",
+        "in press",
+        "2020-02-30",
+        "2020-13-45",
+        "2020-05 approx",
+        "2019a",
+        "[2019]",
+        "99999999999",
+    ];
+    for date in dates {
+        let input = format!("@article{{k, title = {{T}}, date = {{{date}}}, year = {{2020}}}}\n");
+        let records = parse(&input).unwrap().records;
+        assert_eq!(
+            records[0].date,
+            Some(PublicationDate {
+                year: 2020,
+                month: None,
+                day: None,
+            }),
+            "date = {{{date}}}"
+        );
+        assert_eq!(first_extra(&records[0], "bibtex:year"), None);
+        assert_eq!(first_extra(&records[0], "bibtex:date"), None);
+    }
+}
+
+/// When neither `date` nor `year` can be read, there is no date.
+#[test]
+fn unreadable_date_and_year_give_no_date() {
+    let records = parse("@article{k, title = {T}, date = {in press}, year = {n.d.}}\n")
+        .unwrap()
+        .records;
+    assert_eq!(records[0].date, None);
+}
+
+/// A `date` that can be read wins over a different `year`, including free text that starts with
+/// a negative year and ranges open at either end.
+#[test]
+fn readable_date_wins_over_year() {
+    let records = parse(
+        "@article{a, title = {T}, date = {2024-09-01}, year = {1999}}\n\
+         @article{b, title = {T}, date = {2021 approximate}, year = {1999}}\n\
+         @article{c, title = {T}, date = {-44 BC}, year = {1999}}\n\
+         @article{d, title = {T}, date = {/2021}, year = {1999}}\n\
+         @article{e, title = {T}, date = {2021/}, year = {1999}}\n",
+    )
+    .unwrap()
+    .records;
+    assert_eq!(
+        records[0].date,
+        Some(PublicationDate {
+            year: 2024,
+            month: Some(9),
+            day: Some(1),
+        })
+    );
+    assert_eq!(records[1].date.map(|date| date.year), Some(2021));
+    assert_eq!(records[2].date.map(|date| date.year), Some(-44));
+    assert_eq!(records[3].date.map(|date| date.year), Some(2021));
+    assert_eq!(records[4].date.map(|date| date.year), Some(2021));
+}
+
+/// A `date` whose text starts with something other than a year gives way to the `year`, whatever
+/// follows. The text never starts with a digit or a sign, which can begin a year.
+#[proptest]
+fn date_not_starting_with_a_year_gives_the_year(
+    #[strategy("[ \t]{0,2}[a-zA-Zé?.:][a-zA-Z0-9é ?.,:/-]{0,24}")] date: String,
+    #[strategy(1000_i32..3000)] year: i32,
+) {
+    let input = format!("@article{{k, title = {{T}}, date = {{{date}}}, year = {{{year}}}}}\n");
+    let records = parse(&input).unwrap().records;
+    prop_assert_eq!(records[0].date.map(|d| d.year), Some(year));
+}
+
+/// A `crossref` child of a type that inherits its parent's date takes the parent's date over its
+/// own `year`, which the underlying parser drops while resolving, even when the parent's `date`
+/// cannot be read. A child of a type that inherits no date keeps its own `year`.
+#[test]
+fn crossref_child_takes_the_parents_date() {
+    let year_of_child =
+        |input: &str| -> Option<i32> { parse(input).unwrap().records[1].date.map(|d| d.year) };
+    assert_eq!(
+        year_of_child(
+            "@proceedings{p, title = {P}, date = {2019}}\n\
+             @inproceedings{c, title = {C}, year = {2020}, crossref = {p}}\n"
+        ),
+        Some(2019)
+    );
+    assert_eq!(
+        year_of_child(
+            "@proceedings{p, title = {P}, date = {in press}}\n\
+             @inproceedings{c, title = {C}, year = {2020}, crossref = {p}}\n"
+        ),
+        None
+    );
+    assert_eq!(
+        year_of_child(
+            "@book{p, title = {P}, date = {2019}}\n\
+             @misc{c, title = {C}, year = {2020}, crossref = {p}}\n"
+        ),
+        Some(2020)
+    );
+}
+
 /// A `year` that is not a number gives no date.
 #[test]
 fn year_not_a_number_ignored() {
