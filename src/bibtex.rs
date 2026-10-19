@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use biblatex::{
-    ChunksExt, Date, DateValue, EntryType, PermissiveType, Person, RawBibliography, RawEntry,
-    Spanned,
+    Chunk, ChunksExt, Date, DateValue, EntryType, PermissiveType, Person, RawBibliography,
+    RawEntry, Spanned,
 };
 use winnow::Parser;
 use winnow::ascii::space0;
@@ -61,6 +61,16 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///   budget of 262,144 copies and about 512 MiB; both fields are removed and the entry is kept.
 ///   Sizes are upper bounds on the parser's work, counting field names, the pieces text is parsed
 ///   into, and every `crossref` or `xdata` key read, whether or not it names an entry.
+/// - [`Diagnostic::DroppedField`]: an entry whose date others read while resolving their references
+///   had a `date` or `month` that the underlying parser fails on there, so the field was removed: a
+///   `date` with digits that are not ASCII where a number is read, with more than four year digits
+///   or month `00` among unknown digits (`X`), or with an unknown day in a month of fewer than 31
+///   days when a further entry reads the inherited date again; or, without a `date`, a `month`
+///   followed by a day number above 255, whatever the `year` and `day`. An entry's date is read by
+///   those of the types that have a date, which `misc`, `booklet`, `manual`, `unpublished`,
+///   `software`, `set` and `xdata` do not, and wherever an entry that copies its fields is read. A
+///   `year` with a space after its sign is removed the same way, without a report, since it cannot
+///   be read anyway.
 ///
 /// The whole input is first parsed at once, which resolves `@string` macros and `crossref`
 /// inheritance. If that fails, the input is split into entries at lines starting with `@type{` or
@@ -95,7 +105,10 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// so a readable `year` is dropped only when `date` can be read; a blank or unreadable `date`
 /// falls back to `year`. A `crossref` child of a type that inherits its parent's date, such as an
 /// `inproceedings` of a `proceedings`, takes the parent's date, and the underlying parser drops the
-/// child's own `year` while resolving, even when the parent's `date` cannot be read.
+/// child's own `year` while resolving, even when the parent's `date` cannot be read. A `date` that
+/// the underlying parser would fail on, such as `١٢` in digits that are not ASCII, is read only as
+/// free text, from which `2020 ١٢` still gives 2020; and a child that inherits a date whose day is
+/// unknown, in a month of fewer than 31 days, gets no date from it.
 ///
 /// # Identifiers
 ///
@@ -618,32 +631,38 @@ fn parse_date(entry: &biblatex::Entry) -> Option<PublicationDate> {
 /// The date the `date` field gives: an ISO 8601 date; the start of a range, or its end when the
 /// range is open at the start; or the year that free text starts with. The biblatex crate uses
 /// 0-indexed month and day internally, so both are incremented by 1 before storing.
+///
+/// Text the underlying parser may panic on is read as free text only. The date is parsed from a
+/// fresh copy of its text, because the parser fails on the position of a date it wrote itself,
+/// as it does for one inherited through `crossref`.
 fn date_field(entry: &biblatex::Entry) -> Option<PublicationDate> {
-    match entry.get_as::<PermissiveType<Date>>("date").ok()? {
-        PermissiveType::Typed(d) => {
-            let dt = match d.value {
-                DateValue::At(dt)
-                | DateValue::After(dt)
-                | DateValue::Before(dt)
-                | DateValue::Between(dt, _) => dt,
-            };
-            // biblatex uses 0-indexed month and day.
-            Some(PublicationDate {
-                year: dt.year,
-                month: dt.month.map(|m| m + 1),
-                day: dt.day.map(|d| d + 1),
-            })
-        }
-        PermissiveType::Chunks(c) => {
-            let s = c.format_verbatim();
-            let year = s.split_whitespace().next()?.parse().ok()?;
-            Some(PublicationDate {
-                year,
-                month: None,
-                day: None,
-            })
-        }
-    }
+    let text = entry.get("date")?.format_verbatim();
+    let typed = if guard::date_may_panic(&text) {
+        None
+    } else {
+        let span = 0..text.len();
+        Date::parse(&[Spanned::new(Chunk::Verbatim(text.clone()), span)]).ok()
+    };
+    let Some(d) = typed else {
+        let year = text.split_whitespace().next()?.parse().ok()?;
+        return Some(PublicationDate {
+            year,
+            month: None,
+            day: None,
+        });
+    };
+    let dt = match d.value {
+        DateValue::At(dt)
+        | DateValue::After(dt)
+        | DateValue::Before(dt)
+        | DateValue::Between(dt, _) => dt,
+    };
+    // biblatex uses 0-indexed month and day.
+    Some(PublicationDate {
+        year: dt.year,
+        month: dt.month.map(|m| m + 1),
+        day: dt.day.map(|d| d + 1),
+    })
 }
 
 /// The year the `year` field gives, if it is a number.

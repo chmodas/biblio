@@ -84,6 +84,13 @@ fn diagnostic_line_and_display() {
             Diagnostic::ReferenceTooDeep { line: 7 },
             "references at line 7 go too deep or copy too much: crossref and xdata removed",
         ),
+        (
+            Diagnostic::DroppedField {
+                line: 8,
+                field: "month".into(),
+            },
+            "field month of the entry at line 8 could not be read and was removed",
+        ),
     ];
     for (expected_line, (diagnostic, text)) in (1..).zip(cases) {
         assert_eq!(diagnostic.line(), expected_line);

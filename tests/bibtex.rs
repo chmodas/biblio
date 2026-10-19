@@ -2808,82 +2808,398 @@ fn acyclic_reference_graphs_bounded(input: AcyclicGraph) {
     }
 }
 
-// -- Hostile input: parser panics --
+// -- Hostile input: dates the parser cannot read --
 
-/// The message of the diagnostic for an entry the underlying parser panicked on; a copy of the
-/// message in the guards.
-const PARSER_FAILED: &str = "the underlying parser failed on this entry";
+/// The year of each record's date, in order.
+fn years(parsed: &biblio::Parsed) -> Vec<Option<i32>> {
+    parsed
+        .records
+        .iter()
+        .map(|record| record.date.map(|date| date.year))
+        .collect()
+}
 
-/// An entry the underlying parser panics on is skipped, and the entries around it are kept.
+/// A `date` the underlying parser would panic on is read as free text: one written in digits that
+/// are not ASCII, or, with unknown digits (`X`), a year of more than four digits or a month `00`.
+/// The entry is kept, the `year` gives its date, and nothing is reported.
 #[test]
-fn entry_the_parser_panics_on_skipped() {
+fn dates_the_parser_panics_on_read_as_text() {
+    let dates = [
+        "١٢",
+        "1٢3",
+        "-١٢",
+        "٣",
+        "²³",
+        "2020-٣",
+        "2020-²",
+        "2020-01-٣",
+        "2020-01-01T٣:00",
+        "2020-01-01T12:٣",
+        "2020-01-01T12:00:٣",
+        "2020/١٢",
+        "١٢/2020",
+        "١٢?",
+        "2020-٣/2021",
+        "20200X",
+        "2020-00-XX",
+        "2020-00-xx~",
+    ];
+    for date in dates {
+        let input = format!("@article{{k, title = {{T}}, date = {{{date}}}, year = {{1999}}}}\n");
+        let parsed = parse_hostile(&input);
+        assert_eq!(years(&parsed), vec![Some(1999)], "date = {{{date}}}");
+        assert_eq!(
+            parsed.diagnostics,
+            Vec::<Diagnostic>::new(),
+            "date = {{{date}}}"
+        );
+    }
+}
+
+/// Free text that starts with a year still gives that year when digits that are not ASCII follow.
+#[test]
+fn year_before_digits_that_are_not_ascii_read() {
+    let parsed = parse_hostile("@article{k, title = {T}, date = {2020 (١٤٤١ هـ)}}\n");
+    assert_eq!(years(&parsed), vec![Some(2020)]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// A `crossref` child of a type that needs a date reads its parent's date while resolving. A
+/// parent `date` the parser would panic on is removed and reported, and the parent's `year` then
+/// gives both their dates.
+#[test]
+fn parent_date_the_parser_panics_on_dropped() {
     let parsed = parse_hostile(
-        "@article{a, title = {A}}\n\
-         @article{b, title = {B}, date = {١٢}}\n\
-         @article{c, title = {C}}\n",
+        "@proceedings{p, title = {P}, date = {١٢}, year = {2019}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
     );
-    assert_eq!(titles(&parsed), vec![Some("A"), Some("C")]);
+    assert_eq!(years(&parsed), vec![Some(2019), Some(2019)]);
     assert_eq!(
         parsed.diagnostics,
-        vec![Diagnostic::SkippedEntry {
-            line: 2,
-            message: PARSER_FAILED.to_owned(),
+        vec![Diagnostic::DroppedField {
+            line: 1,
+            field: "date".to_owned(),
         }]
     );
 }
 
-/// When entries are parsed one by one, here forced by a broken entry, a panic while resolving
-/// skips the entries parsed with the one that caused it, and a panic while reading skips that
-/// entry alone.
+/// The same holds when entries are parsed one by one, here forced by a broken entry and with the
+/// parent and child on one line.
 #[test]
-fn entry_the_parser_panics_on_skipped_one_by_one() {
-    let parent = "@proceedings{p, title = {P}, date = {١٢}}";
-    let child = "@inproceedings{c, title = {C}, crossref = {p}}";
-    let broken = "@article{x title = {X}}";
-
-    // On one line, the child resolves against the parent, and resolving panics.
-    let parsed = parse_hostile(&format!("{parent} {child}\n{broken}\n"));
-    assert_eq!(parsed.records, Vec::<Record>::new());
+fn parent_date_the_parser_panics_on_dropped_one_by_one() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {١٢}} \
+         @inproceedings{c, title = {C}, crossref = {p}}\n\
+         @article{x title = {X}}\n",
+    );
+    assert_eq!(titles(&parsed), vec![Some("P"), Some("C")]);
     assert_eq!(
         parsed.diagnostics[0],
-        Diagnostic::SkippedEntry {
+        Diagnostic::DroppedField {
             line: 1,
-            message: PARSER_FAILED.to_owned(),
+            field: "date".to_owned(),
         }
     );
     assert_eq!(parsed.diagnostics.len(), 2);
     assert_eq!(parsed.diagnostics[1].line(), 2);
-
-    // On separate lines, only reading the parent panics, and the child is kept.
-    let parsed = parse_hostile(&format!("{parent}\n{child}\n{broken}\n"));
-    assert_eq!(titles(&parsed), vec![Some("C")]);
-    assert_eq!(
-        parsed.diagnostics[0],
-        Diagnostic::SkippedEntry {
-            line: 1,
-            message: PARSER_FAILED.to_owned(),
-        }
-    );
-    assert_eq!(parsed.diagnostics.len(), 2);
-    assert_eq!(parsed.diagnostics[1].line(), 3);
 }
 
-/// A panic while resolving the whole input falls back to parsing the entries one by one, leaving
-/// nothing behind from the attempt: here the child reads the parent's date while resolving, and
-/// then, parsed alone, only reading the parent panics.
+/// Without a `date`, the child reads its parent's `year` and `month`. A `year` with a space after
+/// its sign, which cannot be read anyway, is removed without a report; a `month` followed by a day
+/// number too large is removed and reported, so it is not in the parent's extras either.
 #[test]
-fn panic_while_resolving_falls_back_to_one_by_one() {
+fn parent_year_and_month_the_parser_panics_on_dropped() {
     let parsed = parse_hostile(
-        "@proceedings{p, title = {P}, date = {١٢}}\n\
+        "@proceedings{p, title = {P}, year = {- 2020}}\n\
          @inproceedings{c, title = {C}, crossref = {p}}\n",
     );
-    assert_eq!(titles(&parsed), vec![Some("C")]);
-    assert_eq!(first_extra(&parsed.records[0], "bibtex:booktitle"), None);
+    assert_eq!(years(&parsed), vec![None, None]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+
+    for month in ["June 1000", "-300", "jan-256"] {
+        let parsed = parse_hostile(&format!(
+            "@proceedings{{p, title = {{P}}, year = {{2020}}, month = {{{month}}}}}\n\
+             @inproceedings{{c, title = {{C}}, crossref = {{p}}}}\n"
+        ));
+        assert_eq!(years(&parsed), vec![Some(2020), Some(2020)], "{month}");
+        assert_eq!(first_extra(&parsed.records[0], "bibtex:month"), None);
+        assert_eq!(
+            parsed.diagnostics,
+            vec![Diagnostic::DroppedField {
+                line: 1,
+                field: "month".to_owned(),
+            }],
+            "{month}"
+        );
+    }
+}
+
+/// A parent that keeps its `date` keeps its `month` too, because the parser then never reads the
+/// month; and an entry nobody refers to keeps it as well.
+#[test]
+fn month_kept_where_the_parser_does_not_read_it() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {2019}, month = {June 1000}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n\
+         @article{a, title = {A}, year = {2020}, month = {June 1000}}\n",
+    );
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+    assert_eq!(
+        first_extra(&parsed.records[0], "bibtex:month"),
+        Some("June 1000")
+    );
+    assert_eq!(
+        first_extra(&parsed.records[2], "bibtex:month"),
+        Some("June 1000")
+    );
+}
+
+/// A parent's `date` that starts with a year, followed by digits that are not ASCII, does not make
+/// the parser fail, so it is kept, and parent and child both get its year. Regression test from
+/// code review: any digit that is not ASCII removed it.
+#[test]
+fn parent_date_with_year_before_other_digits_kept() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {2020 (١٤٤١ هـ)}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
+    );
+    assert_eq!(years(&parsed), vec![Some(2020), Some(2020)]);
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+}
+
+/// An entry referred to only by entries of types that have no date, such as `misc`, keeps its
+/// date fields, because resolving reads none of them. Regression test from code review: every
+/// target lost them.
+#[test]
+fn fields_of_targets_whose_date_nobody_reads_kept() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {١٢}, year = {2019}}\n\
+         @misc{c, title = {C}, crossref = {p}}\n\
+         @proceedings{q, title = {Q}, year = {2020}, month = {June 1000}}\n\
+         @misc{d, title = {D}, crossref = {q}}\n",
+    );
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+    assert_eq!(years(&parsed)[0], Some(2019));
+    assert_eq!(
+        first_extra(&parsed.records[2], "bibtex:month"),
+        Some("June 1000")
+    );
+}
+
+/// An entry of a type that has no date copies the fields of the entries it refers to, so their
+/// dates are read where its own is: here a `misc` between the parent and a child that reads it.
+#[test]
+fn date_copied_through_an_entry_without_a_date_dropped() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {١٢}, year = {2019}}\n\
+         @misc{m, title = {M}, crossref = {p}}\n\
+         @inproceedings{c, title = {C}, crossref = {m}}\n",
+    );
+    assert_eq!(parsed.records.len(), 3);
     assert_eq!(
         parsed.diagnostics,
-        vec![Diagnostic::SkippedEntry {
+        vec![Diagnostic::DroppedField {
             line: 1,
-            message: PARSER_FAILED.to_owned(),
+            field: "date".to_owned(),
         }]
     );
+}
+
+/// A date whose day is unknown, in a month of fewer than 31 days, is written by the parser as a
+/// range ending on day 31 when an entry inherits it. The child cannot read that range, so it has
+/// no date, and the parent keeps its own.
+#[test]
+fn inherited_unknown_day_in_a_short_month_unread() {
+    let parsed = parse_hostile(
+        "@proceedings{g, title = {G}, date = {2021-04-XX}}\n\
+         @inproceedings{p, title = {P}, crossref = {g}}\n",
+    );
+    assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+    assert_eq!(
+        parsed.records[0].date,
+        Some(PublicationDate {
+            year: 2021,
+            month: Some(4),
+            day: Some(1),
+        })
+    );
+    assert_eq!(parsed.records[1].date, None);
+}
+
+/// When a further entry reads that inherited date again while resolving, the parser would panic,
+/// so the original `date` is removed and reported, through `crossref` and through `xdata` alike.
+#[test]
+fn unknown_day_in_a_short_month_read_again_dropped() {
+    let chains = [
+        "@proceedings{g, title = {G}, date = {2021-02-XX}}\n\
+         @inproceedings{p, title = {P}, crossref = {g}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
+        "@xdata{g, date = {2021-11-XX~}}\n\
+         @inproceedings{p, title = {P}, xdata = {g}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
+    ];
+    for input in chains {
+        let parsed = parse_hostile(input);
+        assert_eq!(parsed.records.len(), 3, "{input}");
+        let dropped: Vec<&Diagnostic> = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::DroppedField { .. }))
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![&Diagnostic::DroppedField {
+                line: 1,
+                field: "date".to_owned(),
+            }],
+            "{input}"
+        );
+    }
+}
+
+std::thread_local! {
+    /// How many panics this thread has started, counted by the hook [`count_panics`] installs.
+    static PANICS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Install, once for the process, a panic hook that counts each thread's panics before passing
+/// them on, so a test can tell whether a panic happened even where it was caught.
+fn count_panics() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            PANICS.with(|panics| panics.set(panics.get() + 1));
+            previous(info);
+        }));
+    });
+}
+
+/// Where the generated text goes.
+#[derive(Debug, Arbitrary)]
+enum DatePlacement {
+    /// An entry's own `date`.
+    Own,
+    /// The `date` of the first entry in a chain of references.
+    Date,
+    /// The `year` of the first entry in a chain of references.
+    Year,
+    /// The `month` of the first entry in a chain of references, which has a `year` too.
+    Month,
+}
+
+/// Text shaped like a date, a year or a month, reaching every way the parser may fail on one.
+fn date_like_text() -> impl Strategy<Value = String> {
+    let part = || {
+        prop_oneof![
+            "[0-9]{1,6}",
+            "[0-9]{2,4}[Xx]{1,3}",
+            "[+-] ?[0-9]{1,4}",
+            "00|XX|xx",
+            "[0-9]?[١٢٣²³]{1,2}",
+        ]
+    };
+    prop_oneof![
+        (
+            part(),
+            proptest::option::of(part()),
+            proptest::option::of(part()),
+            proptest::option::of("T[0-9٣]{1,2}(:[0-9]{2})?"),
+            proptest::option::of(part()),
+            "[?~%]?",
+        )
+            .prop_map(|(year, month, day, time, end, mark)| {
+                let mut text = year;
+                for part in [month, day].into_iter().flatten() {
+                    write!(text, "-{part}").unwrap();
+                }
+                text.push_str(time.as_deref().unwrap_or(""));
+                if let Some(end) = end {
+                    write!(text, "/{end}").unwrap();
+                }
+                text + &mark
+            }),
+        "[0-9١٢٣²³ⅫXx+/.~?%TZ: \u{a0}-]{0,16}",
+        "[A-Za-z]{0,5}[ \u{a0}-]{0,2}[0-9]{1,6}",
+        "[0-9]{4}-(0[0-9]|1[0-3])-[Xx]{2}[?~%]?",
+    ]
+}
+
+/// The type of an entry in a chain of references.
+#[derive(Debug, Arbitrary)]
+enum LinkKind {
+    /// A type that has a date, so resolving reads the dates of the entries referred to.
+    InProceedings,
+    /// A type without a date, which copies the fields of the entries referred to.
+    Misc,
+    /// An `xdata` entry, which copies every field of the entries referred to.
+    XData,
+}
+
+/// An entry that refers to the one before it.
+#[derive(Debug, Arbitrary)]
+struct Link {
+    /// The entry's type.
+    kind: LinkKind,
+    /// Whether it refers through `xdata`, rather than `crossref`.
+    xdata: bool,
+}
+
+/// A date-like value in an entry, or at the start of a chain of references.
+#[derive(Debug, Arbitrary)]
+struct DateInput {
+    /// The value.
+    #[strategy(date_like_text())]
+    text: String,
+    /// Where it goes.
+    placement: DatePlacement,
+    /// The entries that refer, one to the next, to the entry holding the value.
+    #[strategy(vec(any::<Link>(), 1..=3))]
+    links: Vec<Link>,
+    /// Whether the entry holding the value is an `xdata` entry, rather than `proceedings`.
+    xdata: bool,
+    /// Whether a broken entry forces the entries to be parsed one by one.
+    one_by_one: bool,
+}
+
+/// However a date, year or month is written, and wherever it is read from, parsing never panics,
+/// not even where the panic would be caught.
+#[proptest(cases = 512)]
+fn date_like_values_never_panic(input: DateInput) {
+    count_panics();
+    let text = &input.text;
+    let mut source = match input.placement {
+        DatePlacement::Own => format!("@article{{e0, title = {{T}}, date = {{{text}}}}}\n"),
+        DatePlacement::Date | DatePlacement::Year | DatePlacement::Month => {
+            let field = match input.placement {
+                DatePlacement::Date => format!("date = {{{text}}}"),
+                DatePlacement::Year => format!("year = {{{text}}}"),
+                _ => format!("year = {{2020}}, month = {{{text}}}"),
+            };
+            let kind = if input.xdata { "xdata" } else { "proceedings" };
+            let mut source = format!("@{kind}{{e0, title = {{T}}, {field}}}\n");
+            for (i, link) in (1..).zip(&input.links) {
+                let kind = match link.kind {
+                    LinkKind::InProceedings => "inproceedings",
+                    LinkKind::Misc => "misc",
+                    LinkKind::XData => "xdata",
+                };
+                let reference = if link.xdata { "xdata" } else { "crossref" };
+                writeln!(
+                    source,
+                    "@{kind}{{e{i}, title = {{T}}, {reference} = {{e{}}}}}",
+                    i - 1
+                )
+                .unwrap();
+            }
+            source
+        }
+    };
+    if input.one_by_one {
+        source.push_str("@article{x title = {X}}\n");
+    }
+    let before = PANICS.with(std::cell::Cell::get);
+    let parsed = parse(&source);
+    prop_assert!(parsed.is_ok());
+    prop_assert_eq!(PANICS.with(std::cell::Cell::get), before, "{}", source);
 }

@@ -11,7 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use biblatex::{Bibliography, Pair, RawBibliography, RawChunk, RawEntry, Spanned};
+use biblatex::{
+    Bibliography, ChunksExt, EntryType, Pair, RawBibliography, RawChunk, RawEntry, Spanned,
+};
 
 use crate::Diagnostic;
 
@@ -671,14 +673,71 @@ impl ReferenceField {
     }
 }
 
-/// Each entry's references, as (target entry, field), in field order: `crossref` first, then each
-/// `xdata` key as listed. Targets that name no entry are left out.
+/// A field the parser reads a date from when it resolves an entry's references.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateField {
+    /// `date`, read on its own when present.
+    Date,
+    /// `year`, read when there is no `date`.
+    Year,
+    /// `month`, read with `year`.
+    Month,
+}
+
+impl DateField {
+    /// The field's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Date => "date",
+            Self::Year => "year",
+            Self::Month => "month",
+        }
+    }
+
+    /// The date field `name` stands for, compared without regard to case.
+    fn of(name: &str) -> Option<Self> {
+        [Self::Date, Self::Year, Self::Month]
+            .into_iter()
+            .find(|field| name.eq_ignore_ascii_case(field.name()))
+    }
+}
+
+/// What resolving the entries' references reads.
+struct ReferenceGraph {
+    /// Each entry's references, as (target entry, field), in field order: `crossref` first, then
+    /// each `xdata` key as listed. Targets that name no entry are left out.
+    targets: Vec<Vec<(usize, ReferenceField)>>,
+    /// Each entry's date fields as the parser reads them: the last of duplicates, with `@string`s
+    /// expanded and braces removed.
+    dates: Vec<Vec<(DateField, String)>>,
+    /// Whether resolving each entry reads the dates of the entries it refers to, which depends on
+    /// its type.
+    reads: Vec<bool>,
+}
+
+/// Whether resolving an entry of `kind` reads the dates of the entries it refers to: every type
+/// but those the parser (biblatex 0.11) gives no date.
+fn reads_dates(kind: &EntryType) -> bool {
+    !matches!(
+        kind,
+        EntryType::Booklet
+            | EntryType::Manual
+            | EntryType::Misc
+            | EntryType::Unpublished
+            | EntryType::Software
+            | EntryType::Set
+            | EntryType::XData
+    )
+}
+
+/// Each entry's references, and its date fields as the parser reads them.
 ///
-/// The parser itself reads the targets, from a copy of the entries holding only their `crossref`,
-/// `xdata` and `ids` fields, the first two renamed so that nothing is resolved. This applies the
-/// parser's own rules for LaTeX in keys and for `ids` aliases. Returns `None` if the copy cannot be
-/// read; the entries then fail the same way before anything is resolved.
-fn reference_graph(raw: &RawBibliography<'_>) -> Option<Vec<Vec<(usize, ReferenceField)>>> {
+/// The parser itself reads them, from a copy of the entries holding only their `crossref`, `xdata`,
+/// `ids` and date fields, the first two renamed so that nothing is resolved. This applies the
+/// parser's own rules for LaTeX in keys and for `ids` aliases, and gives the date fields' text
+/// exactly as the parser reads it. Returns `None` if the copy cannot be read; the entries then fail
+/// the same way before anything is resolved.
+fn reference_graph(raw: &RawBibliography<'_>) -> Option<ReferenceGraph> {
     let entries = raw
         .entries
         .iter()
@@ -691,7 +750,7 @@ fn reference_graph(raw: &RawBibliography<'_>) -> Option<Vec<Vec<(usize, Referenc
                     let name = match ReferenceField::of(pair.key.v) {
                         Some(field) => field.inert_name(),
                         None if pair.key.v.eq_ignore_ascii_case("ids") => "ids",
-                        None => return None,
+                        None => DateField::of(pair.key.v)?.name(),
                     };
                     Some(Pair {
                         key: Spanned::new(name, pair.key.span.clone()),
@@ -724,40 +783,66 @@ fn reference_graph(raw: &RawBibliography<'_>) -> Option<Vec<Vec<(usize, Referenc
             .get(name)
             .and_then(|entry| position.get(entry.key.as_str()).copied())
     };
-    Some(
-        probe
-            .iter()
-            .map(|entry| {
-                let mut targets = Vec::new();
-                if let Ok(name) = entry.get_as::<String>(ReferenceField::Crossref.inert_name()) {
-                    targets.extend(find(&name).map(|target| (target, ReferenceField::Crossref)));
+    let targets = probe
+        .iter()
+        .map(|entry| {
+            let mut targets = Vec::new();
+            if let Ok(name) = entry.get_as::<String>(ReferenceField::Crossref.inert_name()) {
+                targets.extend(find(&name).map(|target| (target, ReferenceField::Crossref)));
+            }
+            if let Ok(names) = entry.get_as::<Vec<String>>(ReferenceField::Xdata.inert_name()) {
+                for name in names {
+                    targets.extend(find(&name).map(|target| (target, ReferenceField::Xdata)));
                 }
-                if let Ok(names) = entry.get_as::<Vec<String>>(ReferenceField::Xdata.inert_name()) {
-                    for name in names {
-                        targets.extend(find(&name).map(|target| (target, ReferenceField::Xdata)));
-                    }
-                }
-                targets
-            })
-            .collect(),
-    )
+            }
+            targets
+        })
+        .collect();
+    let dates = probe
+        .iter()
+        .map(|entry| {
+            [DateField::Date, DateField::Year, DateField::Month]
+                .into_iter()
+                .filter_map(|field| Some((field, entry.get(field.name())?.format_verbatim())))
+                .collect()
+        })
+        .collect();
+    let reads = probe
+        .iter()
+        .map(|entry| reads_dates(&entry.entry_type))
+        .collect();
+    Some(ReferenceGraph {
+        targets,
+        dates,
+        reads,
+    })
 }
 
-/// Remove every field of `entry` that is `field`, in any case. The parser keeps the last of
-/// duplicate fields, so all of them must go.
-fn remove_field(entry: &mut RawEntry<'_>, field: ReferenceField) {
+/// Remove every field of `entry` named `name`, in any case. The parser keeps the last of duplicate
+/// fields, so all of them must go.
+fn remove_field(entry: &mut RawEntry<'_>, name: &str) {
     entry
         .fields
-        .retain(|pair| ReferenceField::of(pair.key.v) != Some(field));
+        .retain(|pair| !pair.key.v.eq_ignore_ascii_case(name));
 }
 
-/// Break every cycle of `crossref` and `xdata` references, and bound the work of resolving the
-/// rest, reporting each entry that lost a field.
+/// Whether `entry` has a field named `name`, in any case.
+fn has_field(entry: &RawEntry<'_>, name: &str) -> bool {
+    entry
+        .fields
+        .iter()
+        .any(|pair| pair.key.v.eq_ignore_ascii_case(name))
+}
+
+/// Break every cycle of `crossref` and `xdata` references, bound the work of resolving the rest,
+/// and remove the date fields that resolving them would fail on, reporting each entry that lost a
+/// field.
 ///
 /// A depth-first search over the entries, in order, finds the references that close a cycle. The
 /// field each came from is removed in full, so an `xdata` listing several entries loses all of
 /// them. Then [`bound_chains`] removes the references of entries whose resolution would go too
-/// deep or copy too much. `lines` holds the line of each entry, `strings` the cost of each
+/// deep or copy too much, and [`unreadable_dates`] the date fields the parser cannot read while
+/// resolving. `lines` holds the line of each entry, `strings` the cost of each
 /// `@string`, and `budget` the work the input may still cause.
 pub(super) fn references(
     raw: &mut RawBibliography<'_>,
@@ -776,9 +861,10 @@ pub(super) fn references(
     if !has_references {
         return;
     }
-    let Some(graph) = reference_graph(raw) else {
+    let Some(reference_graph) = reference_graph(raw) else {
         return;
     };
+    let graph = &reference_graph.targets;
     let edges: Vec<Vec<usize>> = graph
         .iter()
         .map(|targets| targets.iter().map(|&(target, _)| target).collect())
@@ -796,7 +882,7 @@ pub(super) fn references(
             continue;
         }
         for &field in fields {
-            remove_field(&mut raw.entries[entry].v, field);
+            remove_field(&mut raw.entries[entry].v, field.name());
         }
         diagnostics.push(Diagnostic::ReferenceCycle { line: lines[entry] });
     }
@@ -814,6 +900,336 @@ pub(super) fn references(
         })
         .collect();
     bound_chains(raw, &remaining, lines, strings, budget, diagnostics);
+    unreadable_dates(raw, &reference_graph, lines, diagnostics);
+}
+
+/// Remove the date fields that the parser would fail on while resolving references, from the
+/// entries whose date it reads, reporting each removed `date` and `month`.
+///
+/// Resolving an entry of a type that has a date reads the date of each entry it refers to: its
+/// `date`, or else its `year` and `month`. Resolving an entry of another type, such as `misc` or
+/// `xdata`, reads no date but may copy the fields of the entries it refers to, so their dates are
+/// read wherever its own is. Only references that are still in place count.
+///
+/// A target keeps `year` and `month` while it keeps its `date`, which the parser then reads alone.
+/// A `year` removed could not be read anyway. A `month` is judged whatever the `year` and `day`,
+/// since either may be copied in from another entry. A `date` whose day is unknown (`XX`), in a
+/// month of fewer than 31 days, is kept unless the date the parser writes from it is read again by
+/// a further entry, which fails on it.
+fn unreadable_dates(
+    raw: &mut RawBibliography<'_>,
+    graph: &ReferenceGraph,
+    lines: &[usize],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let count = graph.targets.len();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (source, targets) in graph.targets.iter().enumerate() {
+        for &(target, field) in targets {
+            if has_field(&raw.entries[source].v, field.name()) {
+                edges[source].push(target);
+            }
+        }
+    }
+    // Whether each entry's date is read, and whether the date the parser writes from it is read
+    // again. No cycle is left, so sources come before their targets in reverse finishing order.
+    let mut read = vec![false; count];
+    let mut reread = vec![false; count];
+    let roots: Vec<usize> = (0..count).collect();
+    for source in search_graph(&roots, &edges).finished.into_iter().rev() {
+        for &target in &edges[source] {
+            read[target] |= graph.reads[source] || read[source];
+            reread[target] |= read[source];
+        }
+    }
+    for (entry, fields) in graph.dates.iter().enumerate() {
+        if !read[entry] {
+            continue;
+        }
+        let text = |wanted: DateField| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == wanted)
+                .map(|(_, text)| text.as_str())
+        };
+        let mut drop = |field: DateField, report: bool| {
+            remove_field(&mut raw.entries[entry].v, field.name());
+            if report {
+                diagnostics.push(Diagnostic::DroppedField {
+                    line: lines[entry],
+                    field: field.name().to_owned(),
+                });
+            }
+        };
+        if let Some(date) = text(DateField::Date) {
+            if date_may_panic(date) || (reread[entry] && rewritten_date_may_panic(date)) {
+                drop(DateField::Date, true);
+            } else {
+                continue;
+            }
+        }
+        if text(DateField::Year).is_some_and(year_may_panic) {
+            drop(DateField::Year, false);
+        }
+        if text(DateField::Month).is_some_and(month_may_panic) {
+            drop(DateField::Month, true);
+        }
+    }
+}
+
+// The predicates below follow the parser's own scanning of dates (biblatex 0.11), and are checked
+// against the parser by the tests at the end of this file.
+
+/// `text` in upper case, without trailing whitespace and without one trailing mark of an uncertain
+/// or approximate date (`?`, `~` or `%`), as the parser reads a date.
+fn date_body(text: &str) -> String {
+    let upper = text.to_uppercase();
+    let trimmed = upper.trim_end();
+    trimmed
+        .strip_suffix(['?', '~', '%'])
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+/// The text after a hyphen at the start of `text`: whitespace, one or more `-`, and whitespace.
+fn after_hyphen(text: &str) -> Option<&str> {
+    let rest = text.trim_start();
+    let after = rest.trim_start_matches('-');
+    (after.len() < rest.len()).then(|| after.trim_start())
+}
+
+/// The run of ASCII digits at the start of `text`.
+fn leading_digits(text: &str) -> &str {
+    &text[..text.bytes().take_while(u8::is_ascii_digit).count()]
+}
+
+/// Whether the parser may panic reading `text` as a date: when it reaches, in a place it reads a
+/// number, digits that are not ASCII, which it counts by bytes and then fails to convert; or, in a
+/// date with unknown digits (`X`), a year of more than four digits or a month `00`, where its
+/// arithmetic overflows.
+pub(super) fn date_may_panic(text: &str) -> bool {
+    let body = date_body(text);
+    if !body.contains('X') {
+        return range_may_panic(&body);
+    }
+    let rest = body.trim_start();
+    let year = leading_digits(rest).len();
+    if year != 4 {
+        return year > 4;
+    }
+    after_hyphen(&rest[year..]).is_some_and(|rest| leading_digits(rest) == "00")
+}
+
+/// Whether the parser may panic reading `body`, a date without unknown digits, as it reads one: a
+/// single date, or a range of two split at the first `/`, of which one end may be open (blank or
+/// `..`). The second end is read only if the first was.
+fn range_may_panic(body: &str) -> bool {
+    let panics = |text: &str| matches!(scan_date(text), Err(Stop::Panic));
+    let Some((start, end)) = body.split_once('/') else {
+        return panics(body);
+    };
+    let open = |text: &str| text.trim().is_empty() || text == "..";
+    match (open(start), open(end)) {
+        (false, false) => match scan_date(start) {
+            Ok(()) => panics(end),
+            Err(stop) => stop == Stop::Panic,
+        },
+        (false, true) => panics(start),
+        (true, false) => panics(end),
+        (true, true) => false,
+    }
+}
+
+/// Why the parser stops reading a date early.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stop {
+    /// It returns an error.
+    Error,
+    /// It panics.
+    Panic,
+}
+
+/// Date text being read the way the parser reads it.
+struct DateScan<'t> {
+    /// The text not read yet.
+    rest: &'t str,
+}
+
+impl DateScan<'_> {
+    /// Skip whitespace.
+    fn space(&mut self) {
+        self.rest = self.rest.trim_start();
+    }
+
+    /// Read `c` if it comes next.
+    fn eat(&mut self, c: char) -> bool {
+        self.rest
+            .strip_prefix(c)
+            .map(|rest| self.rest = rest)
+            .is_some()
+    }
+
+    /// Read a separator that must come next: whitespace, then `c`.
+    fn separator(&mut self, c: char) -> Result<(), Stop> {
+        self.space();
+        if self.eat(c) {
+            Ok(())
+        } else {
+            Err(Stop::Error)
+        }
+    }
+
+    /// Read a number of `bytes` bytes after whitespace and, if `signed`, a sign and whitespace.
+    /// The parser takes every numeric character, ASCII or not, counts them by bytes, and then
+    /// panics converting them if any is not ASCII.
+    fn number(
+        &mut self,
+        bytes: std::ops::RangeInclusive<usize>,
+        signed: bool,
+    ) -> Result<i32, Stop> {
+        self.space();
+        let negative = signed && self.eat('-');
+        if signed && !negative {
+            self.eat('+');
+        }
+        self.space();
+        let length = self
+            .rest
+            .find(|c: char| !c.is_numeric())
+            .unwrap_or(self.rest.len());
+        let (digits, rest) = self.rest.split_at(length);
+        self.rest = rest;
+        if !bytes.contains(&digits.len()) {
+            return Err(Stop::Error);
+        }
+        let value: i32 = digits.parse().map_err(|_| Stop::Panic)?;
+        Ok(if negative { -value } else { value })
+    }
+
+    /// Read a number of one or two bytes no greater than `most`, or at least 1 if `from_one`.
+    fn small(&mut self, from_one: bool, most: i32) -> Result<i32, Stop> {
+        let value = self.number(1..=2, false)?;
+        if value > most || (from_one && value == 0) {
+            return Err(Stop::Error);
+        }
+        Ok(value)
+    }
+
+    /// Skip whitespace and tell whether the text is read.
+    fn done(&mut self) -> bool {
+        self.space();
+        self.rest.is_empty()
+    }
+}
+
+/// The days in month `month` (from 1) of `year`.
+fn days_in_month(month: i32, year: i32) -> i32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Read `text` as a single date the way the parser does: a year of two digits, which it expands,
+/// or else of four; then optionally a month, a day, a time of hours, minutes and seconds, and a
+/// time zone. It stops at the first error, so a number after one is never read.
+fn scan_date(text: &str) -> Result<(), Stop> {
+    let mut scan = DateScan { rest: text };
+    let year = match scan.number(2..=2, true) {
+        Ok(year) => year + if year < 50 { 2000 } else { 1900 },
+        Err(Stop::Error) => {
+            scan.rest = text;
+            scan.number(4..=4, true)?
+        }
+        Err(Stop::Panic) => return Err(Stop::Panic),
+    };
+    if scan.done() {
+        return Ok(());
+    }
+    scan.separator('-')?;
+    while scan.eat('-') {}
+    let month = scan.small(true, 12)?;
+    if scan.done() {
+        return Ok(());
+    }
+    scan.separator('-')?;
+    while scan.eat('-') {}
+    let day = scan.small(true, 31)?;
+    if day > days_in_month(month, year) {
+        return Err(Stop::Error);
+    }
+    if scan.done() {
+        return Ok(());
+    }
+    if !scan.eat('T') {
+        return Err(Stop::Error);
+    }
+    scan.small(false, 23)?;
+    for _ in 0..2 {
+        if scan.done() {
+            return Ok(());
+        }
+        scan.separator(':')?;
+        scan.small(false, 59)?;
+    }
+    if scan.done() {
+        return Ok(());
+    }
+    if scan.eat('Z') {
+        return Ok(());
+    }
+    if !scan.eat('+') && !scan.eat('-') {
+        return Err(Stop::Error);
+    }
+    scan.small(false, 23)?;
+    if scan.done() {
+        return Ok(());
+    }
+    scan.separator(':')?;
+    scan.small(false, 59).map(|_| ())
+}
+
+/// Whether the parser may panic reading `text` as a date again after writing it out itself, as it
+/// does when an entry inherits it: a date whose day is unknown (`XX`) in a month of fewer than 31
+/// days is written as a range ending on day 31, which the parser then fails on.
+fn rewritten_date_may_panic(text: &str) -> bool {
+    let body = date_body(text);
+    let rest = body.trim_start();
+    let year = leading_digits(rest);
+    if year.len() != 4 {
+        return false;
+    }
+    let Some(rest) = after_hyphen(&rest[4..]) else {
+        return false;
+    };
+    let month = leading_digits(rest);
+    if !matches!(month, "02" | "04" | "06" | "09" | "11") {
+        return false;
+    }
+    after_hyphen(&rest[2..]).is_some_and(|rest| rest.trim_end() == "XX")
+}
+
+/// Whether the parser may panic reading `text` as a `year`: a sign with whitespace before the
+/// digits, which it then fails to convert.
+fn year_may_panic(text: &str) -> bool {
+    let Some(after_sign) = text.trim_start().strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let digits = after_sign.trim_start();
+    digits.len() < after_sign.len() && (1..=4).contains(&leading_digits(digits).len())
+}
+
+/// Whether the parser may panic reading `text` as a `month`: a day number after the month name
+/// that does not fit in a byte.
+fn month_may_panic(text: &str) -> bool {
+    let rest = text
+        .trim_start()
+        .trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let after = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '-');
+    let day = leading_digits(after);
+    after.len() < rest.len() && !day.is_empty() && day.parse::<u8>().is_err()
 }
 
 /// The longest chain of references resolved for one entry. The parser recurses once for each.
@@ -986,8 +1402,8 @@ fn bound_chains(
         let over_budget =
             !cut[entry] && !targets[entry].is_empty() && !budget.take_references(work[entry]);
         if cut[entry] || over_budget {
-            remove_field(&mut raw.entries[entry].v, ReferenceField::Crossref);
-            remove_field(&mut raw.entries[entry].v, ReferenceField::Xdata);
+            remove_field(&mut raw.entries[entry].v, ReferenceField::Crossref.name());
+            remove_field(&mut raw.entries[entry].v, ReferenceField::Xdata.name());
             diagnostics.push(Diagnostic::ReferenceTooDeep { line: lines[entry] });
         }
     }
@@ -1037,6 +1453,8 @@ mod tests {
 
     use proptest::prelude::*;
     use test_strategy::proptest;
+
+    use biblatex::{Date, Type as _};
 
     use super::*;
 
@@ -1138,9 +1556,11 @@ mod tests {
         }
     }
 
-    /// `catching` returns what `f` returns, or `None` if it panics.
+    /// `catching` returns what `f` returns, or `None` if it panics. The panic is not the
+    /// parser's, so the hook that silences the parser's panics passes it on.
     #[test]
     fn catching_turns_a_panic_into_none() {
+        silence_parser_panics();
         assert_eq!(catching(|| 1), Some(1));
         assert_eq!(catching(|| -> i32 { panic!("boom") }), None);
     }
@@ -1187,5 +1607,196 @@ mod tests {
 
         let raw = RawBibliography::parse("@article{a,}\n@article{a,}\n").unwrap();
         assert!(resolve(raw).is_err_and(|message| message != PARSER_FAILED));
+    }
+
+    /// Install, once for the process, a panic hook that stays silent for panics in the
+    /// underlying parser, which the parity tests below cause on purpose, and passes on the rest.
+    fn silence_parser_panics() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if !info
+                    .location()
+                    .is_some_and(|location| location.file().contains("biblatex"))
+                {
+                    previous(info);
+                }
+            }));
+        });
+    }
+
+    /// `text` as the chunks of a field value, at a real position in a source.
+    fn chunks(text: &str) -> Vec<Spanned<biblatex::Chunk>> {
+        vec![Spanned::new(
+            biblatex::Chunk::Normal(text.to_owned()),
+            0..text.len(),
+        )]
+    }
+
+    /// Text shaped like a date, reaching every way the parser may fail on one: years of any
+    /// length, unknown digits, signs, months `00`, days unknown in short months, times, ranges,
+    /// marks, and digits that are not ASCII.
+    fn date_text() -> impl Strategy<Value = String> {
+        let part = || {
+            prop_oneof![
+                "[0-9]{1,6}",
+                "[0-9]{2,5}[Xx]{1,3}",
+                "[+-] ?[0-9]{1,4}",
+                "00|0[2469]|11|XX|xx",
+                "[0-9]?[\u{661}\u{662}\u{b2}]{1,2}",
+                "[0-9]{4} ?[(]?[\u{661}\u{662}]{1,2}[)]?",
+            ]
+        };
+        prop_oneof![
+            (
+                part(),
+                proptest::option::of(("[ -]{1,3}", part())),
+                proptest::option::of(("[ -]{1,3}", part())),
+                proptest::option::of(concat!(
+                    "[Tt] ?[0-9\u{663}]{1,2}( ?: ?[0-9\u{663}]{1,2}){0,2}",
+                    "( ?[Zz+-][0-9\u{663}]{0,2}(:[0-9]{2})?)?",
+                )),
+                proptest::option::of(("/|/..|../", part())),
+                "[?~%]?[ ]?",
+            )
+                .prop_map(|(year, month, day, time, end, mark)| {
+                    let mut text = year;
+                    for (hyphen, part) in [month, day].into_iter().flatten() {
+                        text.push_str(&hyphen);
+                        text.push_str(&part);
+                    }
+                    text.push_str(time.as_deref().unwrap_or(""));
+                    if let Some((slash, end)) = end {
+                        text.push_str(&slash);
+                        text.push_str(&end);
+                    }
+                    text + &mark
+                }),
+            "[0-9\u{661}\u{b2}Xx+/.~?%TZ: -]{0,14}",
+            "[ ]?[0-9]{4} ?-{1,2} ?(0[0-9]|1[0-3]) ?- ?[Xx]{1,3}[?~%]?[ ]?",
+            concat!(
+                "[+-]?[0-9]{2}(00)?-(0[0-9]|1[0-3])-(0[0-9]|2[89]|3[0-2])",
+                "[Tt ]?[0-9\u{663}]{1,2}(:[0-9\u{663}]{1,2}){0,2}",
+                "([Zz]|[+-][0-9\u{663}]{1,2}(:[0-9\u{663}]{1,2})?)?",
+            ),
+        ]
+    }
+
+    /// The date predicates agree with the parser: text they pass never makes it panic, and they
+    /// flag exactly the text it panics on. Some of those panics are overflows, which happen only
+    /// where overflow is checked, as in this build.
+    #[proptest(cases = 4096)]
+    fn date_predicates_match_the_parser(#[strategy(date_text())] text: String) {
+        silence_parser_panics();
+        let parsed = catching(|| Date::parse(&chunks(&text)));
+        if !date_may_panic(&text) {
+            prop_assert!(parsed.is_some(), "{:?}", text);
+        }
+        if cfg!(debug_assertions) {
+            prop_assert_eq!(date_may_panic(&text), parsed.is_none(), "{:?}", text);
+        }
+        // A date the parser reads is written out again when an entry inherits it, and read
+        // from the text it wrote, which has no position in the source.
+        if let Some(Ok(date)) = parsed {
+            let rewritten = date.to_chunks();
+            let reread = catching(|| Date::parse(&rewritten));
+            if !rewritten_date_may_panic(&text) {
+                prop_assert!(reread.is_some(), "{:?}", text);
+            }
+            if cfg!(debug_assertions) {
+                prop_assert_eq!(
+                    rewritten_date_may_panic(&text),
+                    reread.is_none(),
+                    "{:?}",
+                    text
+                );
+            }
+        }
+    }
+
+    /// The `year` predicate flags exactly the text the parser panics on as a year.
+    #[proptest(cases = 2048)]
+    fn year_predicate_matches_the_parser(
+        #[strategy("[ \t]{0,2}[+-]?[ \t\u{a0}]{0,2}[0-9]{0,6}[A-Za-z ]{0,3}")] text: String,
+    ) {
+        silence_parser_panics();
+        let panicked = catching(|| Date::parse_three_fields(&chunks(&text), None, None)).is_none();
+        prop_assert_eq!(year_may_panic(&text), panicked, "{:?}", text);
+    }
+
+    /// The `month` predicate flags exactly the text the parser panics on as a month, read with a
+    /// year and no day.
+    #[proptest(cases = 2048)]
+    fn month_predicate_matches_the_parser(
+        #[strategy("[ ]{0,2}[A-Za-z]{0,5}[ \u{a0}\t-]{0,3}[0-9]{0,6}[a-z ]{0,2}")] text: String,
+    ) {
+        silence_parser_panics();
+        let year = chunks("2020");
+        let panicked =
+            catching(|| Date::parse_three_fields(&year, Some(&chunks(&text)), None)).is_none();
+        prop_assert_eq!(month_may_panic(&text), panicked, "{:?}", text);
+    }
+
+    /// Dates ending after each part, up to times and time zones, which random text rarely
+    /// reaches: the scan agrees with the parser on where it panics, fails or reads.
+    #[test]
+    fn scan_matches_the_parser_on_times_and_zones() {
+        silence_parser_panics();
+        let cases = [
+            ("44", Ok(())),
+            ("-0044-03", Ok(())),
+            ("2020-02-30", Err(Stop::Error)),
+            ("2020-01-02", Ok(())),
+            ("2020-01-02 03", Err(Stop::Error)),
+            ("2020-01-02T03", Ok(())),
+            ("2020-01-02T03:04", Ok(())),
+            ("2020-01-02T03:04:05", Ok(())),
+            ("2020-01-02T03:04:05Z", Ok(())),
+            ("2020-01-02T03:04:05 Z trailing", Ok(())),
+            ("2020-01-02T03:04:05+01", Ok(())),
+            ("2020-01-02T03:04:05-01 : 30", Ok(())),
+            ("2020-01-02T03:04:05+\u{663}", Err(Stop::Panic)),
+            ("2020-01-02T03:04:05-01:\u{663}", Err(Stop::Panic)),
+            ("2020-01-02T03:04:05+24", Err(Stop::Error)),
+            ("2020-01-02T03:04:05-01:60", Err(Stop::Error)),
+            ("2020-01-02T03:04:05-01;30", Err(Stop::Error)),
+            ("2020-01-02T03:04:05Q", Err(Stop::Error)),
+        ];
+        // Only an unknown day in a short month makes the rewritten date fail.
+        for (text, fails) in [
+            ("2021", false),
+            ("2021-04", false),
+            ("2021-05-XX", false),
+            ("2021-04-XX", true),
+            ("2021 - 02 - XX ~", true),
+        ] {
+            assert_eq!(rewritten_date_may_panic(text), fails, "{text}");
+            let date = Date::parse(&chunks(text)).unwrap();
+            let rewritten = date.to_chunks();
+            assert_eq!(
+                catching(|| Date::parse(&rewritten)).is_none(),
+                fails,
+                "{text}"
+            );
+        }
+        // A range with both ends open is an error, whatever its ends hold.
+        for text in ["/", " / ", "../..", "/.."] {
+            assert!(!date_may_panic(text), "{text}");
+            assert!(matches!(
+                catching(|| Date::parse(&chunks(text))),
+                Some(Err(_))
+            ));
+        }
+        for (text, expected) in cases {
+            assert_eq!(scan_date(text), expected, "{text}");
+            let parsed = catching(|| Date::parse(&chunks(text)));
+            let parser = match parsed {
+                None => Err(Stop::Panic),
+                Some(Err(_)) => Err(Stop::Error),
+                Some(Ok(_)) => Ok(()),
+            };
+            assert_eq!(parser, expected, "{text}");
+        }
     }
 }
