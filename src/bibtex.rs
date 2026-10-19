@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use biblatex::{
-    Bibliography, ChunksExt, Date, DateValue, EntryType, PermissiveType, Person, RawBibliography,
-    RawEntry, Spanned,
+    ChunksExt, Date, DateValue, EntryType, PermissiveType, Person, RawBibliography, RawEntry,
+    Spanned,
 };
 use winnow::Parser;
 use winnow::ascii::space0;
@@ -35,7 +35,11 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// - [`Diagnostic::SkippedEntry`]: an entry or `@string` definition could not be parsed and was
 ///   dropped. This includes values whose braces nest more than 128 deep, which would overflow the
 ///   stack: the nesting of every `{` and `}` is counted, plain groups and escaped braces included,
-///   in every field, verbatim ones such as `url` too.
+///   in every field, verbatim ones such as `url` too. An entry the underlying parser panics on is
+///   skipped too, with the message "the underlying parser failed on this entry"; if the panic
+///   comes while resolving references, the entries parsed with it are skipped under that one
+///   message. The panic hook still runs, so the default hook prints the panic, and with
+///   `panic = "abort"` the process still aborts.
 ///   When a `@string` is dropped, every definition of that name goes with it, and an entry using it
 ///   is skipped, or falls back to the month for a month name. A `crossref` to a skipped entry
 ///   inherits nothing.
@@ -63,7 +67,8 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// `@type(` and each entry is parsed on its own, with the `@string` macros of every entry that
 /// could be read. In that case `crossref` inheritance is lost for the whole input. The whole-input
 /// parse fails on a broken entry, a duplicate citation key (or an `ids` alias that clashes with a
-/// key), or an undefined macro; on the per-entry path, entries with duplicate keys are all kept.
+/// key), an undefined macro, or the underlying parser panicking while resolving references; on the
+/// per-entry path, entries with duplicate keys are all kept.
 ///
 /// Text outside entries is a `BibTeX` comment and is not reported. Entries written with
 /// parentheses, `@type(...)`, are not supported and are skipped. A stray `@word` in text between
@@ -138,13 +143,15 @@ fn parse_whole(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<Dia
     );
     raw.abbreviations = strings.needed(&raw.abbreviations, &raw.entries);
     guard::references(&mut raw, &lines, &strings, &mut budget, diagnostics);
-    let Ok(bibliography) = Bibliography::from_raw(raw) else {
+    let Ok(bibliography) = guard::resolve(raw) else {
         return false;
     };
     // `from_raw` keeps the raw entries one-for-one and in order (it rejects a duplicate key rather
     // than replacing an entry), so each entry lines up with its line.
     for (entry, line) in bibliography.iter().zip(lines) {
-        records.push(record_from_entry(entry, line, diagnostics));
+        records.extend(guard::or_skipped(line, diagnostics, |diagnostics| {
+            record_from_entry(entry, line, diagnostics)
+        }));
     }
     true
 }
@@ -195,16 +202,15 @@ fn parse_entries(input: &str, records: &mut Vec<Record>, diagnostics: &mut Vec<D
             abbreviations: needed,
         };
         guard::references(&mut raw, &lines, &strings, &mut budget, diagnostics);
-        match Bibliography::from_raw(raw) {
+        match guard::resolve(raw) {
             Ok(bibliography) => {
                 for entry in bibliography.iter() {
-                    records.push(record_from_entry(entry, line, diagnostics));
+                    records.extend(guard::or_skipped(line, diagnostics, |diagnostics| {
+                        record_from_entry(entry, line, diagnostics)
+                    }));
                 }
             }
-            Err(e) => diagnostics.push(Diagnostic::SkippedEntry {
-                line,
-                message: e.kind.to_string(),
-            }),
+            Err(message) => diagnostics.push(Diagnostic::SkippedEntry { line, message }),
         }
     }
 }
