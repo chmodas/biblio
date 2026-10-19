@@ -70,6 +70,19 @@ pub enum Diagnostic {
         line: usize,
     },
 
+    /// A field of a `BibTeX` entry whose date other entries read while resolving their references
+    /// held a value that the underlying parser fails on there: a `date` with digits that are not
+    /// ASCII where it reads a number, with more than four year digits or month `00` among unknown
+    /// digits (`X`), or with an unknown day in a month of fewer than 31 days that a further entry
+    /// reads again; or a `month` followed by a day number above 255. The field was removed before
+    /// resolving, so neither the entry nor those that refer to it have it. The entry is kept.
+    DroppedField {
+        /// Line where the entry starts.
+        line: usize,
+        /// The field's name, in lower case.
+        field: String,
+    },
+
     /// The input broke off: an `EndNote XML` syntax error, or the end of the input inside a record.
     /// The records before it are kept, the record in progress is dropped, and parsing stops.
     Truncated {
@@ -90,6 +103,7 @@ impl Diagnostic {
             | Self::IgnoredLine { line }
             | Self::ReferenceCycle { line }
             | Self::ReferenceTooDeep { line }
+            | Self::DroppedField { line, .. }
             | Self::SkippedEntry { line, .. }
             | Self::Truncated { line, .. } => *line,
         }
@@ -116,6 +130,10 @@ impl fmt::Display for Diagnostic {
             Self::ReferenceTooDeep { line } => write!(
                 f,
                 "references at line {line} go too deep or copy too much: crossref and xdata removed"
+            ),
+            Self::DroppedField { line, field } => write!(
+                f,
+                "field {field} of the entry at line {line} could not be read and was removed"
             ),
             Self::Truncated { line, message } => {
                 write!(f, "input truncated at line {line}: {message}")
