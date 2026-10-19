@@ -2807,3 +2807,83 @@ fn acyclic_reference_graphs_bounded(input: AcyclicGraph) {
         );
     }
 }
+
+// -- Hostile input: parser panics --
+
+/// The message of the diagnostic for an entry the underlying parser panicked on; a copy of the
+/// message in the guards.
+const PARSER_FAILED: &str = "the underlying parser failed on this entry";
+
+/// An entry the underlying parser panics on is skipped, and the entries around it are kept.
+#[test]
+fn entry_the_parser_panics_on_skipped() {
+    let parsed = parse_hostile(
+        "@article{a, title = {A}}\n\
+         @article{b, title = {B}, date = {١٢}}\n\
+         @article{c, title = {C}}\n",
+    );
+    assert_eq!(titles(&parsed), vec![Some("A"), Some("C")]);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::SkippedEntry {
+            line: 2,
+            message: PARSER_FAILED.to_owned(),
+        }]
+    );
+}
+
+/// When entries are parsed one by one, here forced by a broken entry, a panic while resolving
+/// skips the entries parsed with the one that caused it, and a panic while reading skips that
+/// entry alone.
+#[test]
+fn entry_the_parser_panics_on_skipped_one_by_one() {
+    let parent = "@proceedings{p, title = {P}, date = {١٢}}";
+    let child = "@inproceedings{c, title = {C}, crossref = {p}}";
+    let broken = "@article{x title = {X}}";
+
+    // On one line, the child resolves against the parent, and resolving panics.
+    let parsed = parse_hostile(&format!("{parent} {child}\n{broken}\n"));
+    assert_eq!(parsed.records, Vec::<Record>::new());
+    assert_eq!(
+        parsed.diagnostics[0],
+        Diagnostic::SkippedEntry {
+            line: 1,
+            message: PARSER_FAILED.to_owned(),
+        }
+    );
+    assert_eq!(parsed.diagnostics.len(), 2);
+    assert_eq!(parsed.diagnostics[1].line(), 2);
+
+    // On separate lines, only reading the parent panics, and the child is kept.
+    let parsed = parse_hostile(&format!("{parent}\n{child}\n{broken}\n"));
+    assert_eq!(titles(&parsed), vec![Some("C")]);
+    assert_eq!(
+        parsed.diagnostics[0],
+        Diagnostic::SkippedEntry {
+            line: 1,
+            message: PARSER_FAILED.to_owned(),
+        }
+    );
+    assert_eq!(parsed.diagnostics.len(), 2);
+    assert_eq!(parsed.diagnostics[1].line(), 3);
+}
+
+/// A panic while resolving the whole input falls back to parsing the entries one by one, leaving
+/// nothing behind from the attempt: here the child reads the parent's date while resolving, and
+/// then, parsed alone, only reading the parent panics.
+#[test]
+fn panic_while_resolving_falls_back_to_one_by_one() {
+    let parsed = parse_hostile(
+        "@proceedings{p, title = {P}, date = {١٢}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
+    );
+    assert_eq!(titles(&parsed), vec![Some("C")]);
+    assert_eq!(first_extra(&parsed.records[0], "bibtex:booktitle"), None);
+    assert_eq!(
+        parsed.diagnostics,
+        vec![Diagnostic::SkippedEntry {
+            line: 1,
+            message: PARSER_FAILED.to_owned(),
+        }]
+    );
+}

@@ -1,12 +1,15 @@
-//! Guards that keep hostile `BibTeX` input from overflowing the stack or running without end.
+//! Guards that keep hostile `BibTeX` input from overflowing the stack, running without end or
+//! panicking.
 //!
 //! The underlying parser resolves LaTeX commands, `@string` abbreviations, `crossref` and `xdata`
 //! by recursion, with no limit on depth and no check for cycles. A stack overflow aborts the
 //! process and cannot be caught, so the guards run on the raw bibliography, before anything is
 //! resolved, and drop what would recurse too deeply or without end. Each guard is iterative, so the
-//! guard itself cannot overflow.
+//! guard itself cannot overflow. As a last resort, a panic in the parser is caught, and the entry
+//! it happened on is skipped.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use biblatex::{Bibliography, Pair, RawBibliography, RawChunk, RawEntry, Spanned};
 
@@ -990,6 +993,43 @@ fn bound_chains(
     }
 }
 
+/// The message of a [`Diagnostic::SkippedEntry`] for an entry the underlying parser panicked on.
+pub(super) const PARSER_FAILED: &str = "the underlying parser failed on this entry";
+
+/// Run `f`, returning `None` if it panics.
+///
+/// This is a last resort for panics in the underlying parser that the other guards do not prevent.
+/// The panic hook still runs, so the default hook prints the panic's message, and with
+/// `panic = "abort"` the process still aborts.
+pub(super) fn catching<T>(f: impl FnOnce() -> T) -> Option<T> {
+    catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
+/// Resolve `raw`, describing why it failed if the parser returned an error or panicked.
+pub(super) fn resolve(raw: RawBibliography<'_>) -> Result<Bibliography, String> {
+    catching(|| Bibliography::from_raw(raw).map_err(|error| error.kind.to_string()))
+        .unwrap_or_else(|| Err(PARSER_FAILED.to_owned()))
+}
+
+/// Run `f` on `diagnostics`. If it panics, drop whatever it reported and report the entry at `line`
+/// as skipped instead.
+pub(super) fn or_skipped<T>(
+    line: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+    f: impl FnOnce(&mut Vec<Diagnostic>) -> T,
+) -> Option<T> {
+    let before = diagnostics.len();
+    let result = catching(|| f(diagnostics));
+    if result.is_none() {
+        diagnostics.truncate(before);
+        diagnostics.push(Diagnostic::SkippedEntry {
+            line,
+            message: PARSER_FAILED.to_owned(),
+        });
+    }
+    result
+}
+
 // The cost model is internal, so it is tested here, against a direct simulation of the parser.
 #[cfg(test)]
 mod tests {
@@ -1096,5 +1136,56 @@ mod tests {
                 estimate.bytes
             );
         }
+    }
+
+    /// `catching` returns what `f` returns, or `None` if it panics.
+    #[test]
+    fn catching_turns_a_panic_into_none() {
+        assert_eq!(catching(|| 1), Some(1));
+        assert_eq!(catching(|| -> i32 { panic!("boom") }), None);
+    }
+
+    /// `or_skipped` keeps what `f` reports unless it panics; then what it reported is dropped and
+    /// the entry is reported as skipped, after what was reported before.
+    #[test]
+    fn or_skipped_replaces_what_a_panic_reported() {
+        let mut diagnostics = vec![Diagnostic::MissingTitle { line: 1 }];
+        let kept = or_skipped(2, &mut diagnostics, |diagnostics| {
+            diagnostics.push(Diagnostic::MissingTitle { line: 2 });
+            "kept"
+        });
+        assert_eq!(kept, Some("kept"));
+        assert_eq!(diagnostics.len(), 2);
+
+        let skipped = or_skipped(3, &mut diagnostics, |diagnostics| -> &str {
+            diagnostics.push(Diagnostic::MissingTitle { line: 3 });
+            panic!("boom")
+        });
+        assert_eq!(skipped, None);
+        assert_eq!(
+            diagnostics,
+            vec![
+                Diagnostic::MissingTitle { line: 1 },
+                Diagnostic::MissingTitle { line: 2 },
+                Diagnostic::SkippedEntry {
+                    line: 3,
+                    message: PARSER_FAILED.to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// `resolve` reports a panic while resolving as [`PARSER_FAILED`], and an error by its
+    /// message. The input has not been through the other guards, so the parser really panics on
+    /// it: resolving the child reads the parent's date, written in digits that are not ASCII.
+    #[test]
+    fn resolve_reports_panics_and_errors() {
+        let input = "@proceedings{p, title = {P}, date = {\u{661}\u{662}}}\n\
+                     @inproceedings{c, title = {C}, crossref = {p}}\n";
+        let raw = RawBibliography::parse(input).unwrap();
+        assert_eq!(resolve(raw).err().as_deref(), Some(PARSER_FAILED));
+
+        let raw = RawBibliography::parse("@article{a,}\n@article{a,}\n").unwrap();
+        assert!(resolve(raw).is_err_and(|message| message != PARSER_FAILED));
     }
 }
