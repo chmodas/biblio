@@ -108,7 +108,11 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// child's own `year` while resolving, even when the parent's `date` cannot be read. A `date` that
 /// the underlying parser would fail on, such as `١٢` in digits that are not ASCII, is read only as
 /// free text, from which `2020 ١٢` still gives 2020; and a child that inherits a date whose day is
-/// unknown, in a month of fewer than 31 days, gets no date from it.
+/// unknown, in a month of fewer than 31 days, gets no date from it. A two-digit year expands as
+/// the underlying parser expands it, to a year from 1950 to 2049 (`44` gives 2044, `99` gives
+/// 1999), unless it has a sign, which marks a full year: `-44` gives -44 and `+77` gives 77. An
+/// entry whose date is filled in from a `crossref` parent or an `xdata` entry still gets the
+/// parser's reading of a signed two-digit year there, so `-44` gives it 1956.
 ///
 /// # Identifiers
 ///
@@ -632,6 +636,8 @@ fn parse_date(entry: &biblatex::Entry) -> Option<PublicationDate> {
 /// range is open at the start; or the year that free text starts with. The biblatex crate uses
 /// 0-indexed month and day internally, so both are incremented by 1 before storing.
 ///
+/// A year written with a sign and two digits, such as `-44`, is read as written.
+///
 /// Text the underlying parser may panic on is read as free text only. The date is parsed from a
 /// fresh copy of its text, because the parser fails on the position of a date it wrote itself,
 /// as it does for one inherited through `crossref`.
@@ -651,18 +657,34 @@ fn date_field(entry: &biblatex::Entry) -> Option<PublicationDate> {
             day: None,
         });
     };
-    let dt = match d.value {
-        DateValue::At(dt)
-        | DateValue::After(dt)
-        | DateValue::Before(dt)
-        | DateValue::Between(dt, _) => dt,
+    // The date used, and the text it was read from: the end of a range open at the start, and
+    // otherwise its start.
+    let (dt, source) = match d.value {
+        DateValue::Before(dt) => (dt, text.split_once('/').map_or(&*text, |(_, end)| end)),
+        DateValue::At(dt) | DateValue::After(dt) | DateValue::Between(dt, _) => {
+            (dt, text.split_once('/').map_or(&*text, |(start, _)| start))
+        }
     };
     // biblatex uses 0-indexed month and day.
     Some(PublicationDate {
-        year: dt.year,
+        year: signed_short_year(source).unwrap_or(dt.year),
         month: dt.month.map(|m| m + 1),
         day: dt.day.map(|d| d + 1),
     })
+}
+
+/// The year that date text starting with a sign and exactly two digits stands for, such as -44 for
+/// `-44-03-15`. The underlying parser expands two digits into a year near 2000 even after a sign,
+/// which marks a full year, so `-44` would give 1956 and `+77` 1977. The month and day it reads
+/// stay right, because a year and its expansion are leap years alike.
+fn signed_short_year(text: &str) -> Option<i32> {
+    let text = text.trim_start();
+    let digits = text.strip_prefix(['+', '-'])?.trim_start();
+    if digits.bytes().take_while(u8::is_ascii_digit).count() != 2 {
+        return None;
+    }
+    let year: i32 = digits[..2].parse().ok()?;
+    Some(if text.starts_with('-') { -year } else { year })
 }
 
 /// The year the `year` field gives, if it is a number.

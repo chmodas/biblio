@@ -384,6 +384,132 @@ fn year_not_a_number_ignored() {
     assert_eq!(records[0].date, None);
 }
 
+/// The date `date` gives in an entry that also has a different `year`.
+fn date_of(date: &str) -> Option<PublicationDate> {
+    let input = format!("@article{{k, title = {{T}}, date = {{{date}}}, year = {{1999}}}}\n");
+    parse(&input).unwrap().records[0].date
+}
+
+/// A year written with a sign and two digits is read as written, with the month and day given,
+/// at either end of a range; four digits and one digit already were.
+#[test]
+fn signed_two_digit_year_read_at_either_end_of_range() {
+    let cases = [
+        ("-44", -44, None, None),
+        ("+77", 77, None, None),
+        ("-77", -77, None, None),
+        ("- 44", -44, None, None),
+        ("-44-03-15", -44, Some(3), Some(15)),
+        ("-44-02-29", -44, Some(2), Some(29)),
+        ("-44/2020", -44, None, None),
+        ("/-44", -44, None, None),
+        ("../-44", -44, None, None),
+        ("-44~", -44, None, None),
+        ("-0044", -44, None, None),
+        ("-4", -4, None, None),
+        ("2020/-44", 2020, None, None),
+    ];
+    for (date, year, month, day) in cases {
+        assert_eq!(
+            date_of(date),
+            Some(PublicationDate { year, month, day }),
+            "date = {{{date}}}"
+        );
+    }
+}
+
+/// A day that does not exist in a signed two-digit year is not a date, so the `year` is read.
+#[test]
+fn impossible_day_in_signed_two_digit_year_falls_back() {
+    assert_eq!(date_of("-45-02-29").map(|date| date.year), Some(1999));
+}
+
+/// A two-digit year without a sign expands to a year from 1950 to 2049.
+#[test]
+fn unsigned_two_digit_year_expanded() {
+    assert_eq!(date_of("44").map(|date| date.year), Some(2044));
+    assert_eq!(date_of("99").map(|date| date.year), Some(1999));
+}
+
+/// An entry whose date is filled in from another entry gets the underlying parser's reading of
+/// a signed two-digit year, through `crossref` and through `xdata` alike.
+#[test]
+fn inherited_signed_two_digit_year_expanded() {
+    let inputs = [
+        "@proceedings{p, title = {P}, date = {-44}}\n\
+         @inproceedings{c, title = {C}, crossref = {p}}\n",
+        "@xdata{p, date = {-44}}\n@inproceedings{c, title = {C}, xdata = {p}}\n",
+    ];
+    for input in inputs {
+        let parsed = parse(input).unwrap();
+        assert_eq!(years(&parsed), vec![Some(-44), Some(1956)], "{input}");
+    }
+}
+
+/// A signed two-digit year with a valid month and day.
+#[derive(Debug, Arbitrary)]
+struct SignedShortDate {
+    /// Whether the year is before the year 0.
+    negative: bool,
+    /// The year's two digits.
+    #[strategy(0_i32..100)]
+    digits: i32,
+    /// Whitespace between the sign and the digits.
+    #[strategy("[ \t\u{a0}]{0,2}")]
+    space: String,
+    /// The month, if any.
+    #[strategy(proptest::option::of(1_u8..=12))]
+    month: Option<u8>,
+    /// The day, if the month is given, valid in that month of that year.
+    #[strategy(proptest::option::of(1_u8..=days_in_month(#negative, #digits, #month)))]
+    day: Option<u8>,
+    /// A trailing mark of an uncertain or approximate date.
+    #[strategy("[?~%]?")]
+    mark: String,
+}
+
+/// The days in `month` of the year a signed two-digit year stands for; 31 without a month.
+fn days_in_month(negative: bool, digits: i32, month: Option<u8>) -> u8 {
+    let year = if negative { -digits } else { digits };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    match month {
+        Some(2) if leap => 29,
+        Some(2) => 28,
+        Some(4 | 6 | 9 | 11) => 30,
+        _ => 31,
+    }
+}
+
+/// Every signed two-digit year is read as written, with its month and day.
+#[proptest]
+fn signed_two_digit_years_read_as_written(input: SignedShortDate) {
+    let sign = if input.negative { '-' } else { '+' };
+    let mut date = format!("{sign}{}{:02}", input.space, input.digits);
+    let day = input.month.and(input.day);
+    if let Some(month) = input.month {
+        write!(date, "-{month:02}").unwrap();
+        if let Some(day) = day {
+            write!(date, "-{day:02}").unwrap();
+        }
+    }
+    date.push_str(&input.mark);
+    let year = if input.negative {
+        -input.digits
+    } else {
+        input.digits
+    };
+    prop_assert_eq!(
+        date_of(&date),
+        Some(PublicationDate {
+            year,
+            month: input.month,
+            day,
+        }),
+        "{}",
+        date
+    );
+}
+
 // -- Pages --
 
 #[test]
