@@ -319,6 +319,87 @@ fn extras_label_only() {
     assert_eq!(first_extra(&records[0], "endnote:rec-number"), None);
 }
 
+// -- Source database --
+
+/// Wrap the elements `body` in a single `<record>` with a title, and parse it.
+fn parse_record(body: &str) -> Record {
+    let input = format!(
+        "<xml><records><record><titles><title>t</title></titles>{body}</record></records></xml>"
+    );
+    parse(&input).unwrap().records.remove(0)
+}
+
+/// `remote-database-name` is read as the database, with the style tags `EndNote` wraps it in
+/// removed, and is not kept in extras.
+#[test]
+fn remote_database_name_read_as_database() {
+    let record = parse_record(
+        r#"<remote-database-name><style face="normal" font="default" size="100%">Scopus</style></remote-database-name>"#,
+    );
+    assert_eq!(record.database.as_deref(), Some("Scopus"));
+    assert!(!record.extras.contains_key("endnote:remote-database-name"));
+}
+
+/// A repeated `remote-database-name` keeps its last value.
+#[test]
+fn repeated_remote_database_name_keeps_last() {
+    let record = parse_record(
+        "<remote-database-name>Embase</remote-database-name>\
+         <remote-database-name>MEDLINE</remote-database-name>",
+    );
+    assert_eq!(record.database.as_deref(), Some("MEDLINE"));
+}
+
+/// The database provider is not the database, and stays in extras.
+#[test]
+fn remote_database_provider_kept_in_extras() {
+    let record =
+        parse_record("<remote-database-provider>Ovid Technologies</remote-database-provider>");
+    assert_eq!(record.database, None);
+    assert_eq!(
+        first_extra(&record, "endnote:remote-database-provider"),
+        Some("Ovid Technologies")
+    );
+}
+
+/// The database is written as `<remote-database-name>` directly under `<record>`, after `<isbn>`.
+#[test]
+fn serialize_writes_remote_database_name() {
+    let record = Record::builder()
+        .title("T")
+        .isbn("1234-5678")
+        .database("PubMed")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains(
+        "<isbn>1234-5678</isbn><remote-database-name>PubMed</remote-database-name></record>"
+    ));
+}
+
+/// A blank database read from `RIS` is written to `EndNote XML` as an empty element, which reads
+/// back as no database.
+#[test]
+fn blank_database_from_ris_reads_back_as_none() {
+    let from_ris = biblio::ris::parse("TY  - JOUR\nTI  - t\nDB  -\nER  -\n")
+        .unwrap()
+        .records;
+    assert_eq!(from_ris[0].database.as_deref(), Some(""));
+    let reparsed = parse(&serialize(&from_ris)).unwrap().records;
+    assert_eq!(reparsed[0].database, None);
+}
+
+/// The database read from `EndNote XML` is carried through a conversion to `RIS` and back.
+#[test]
+fn database_carried_from_endnote_to_ris() {
+    let records = vec![parse_record(
+        "<remote-database-name>CINAHL</remote-database-name>",
+    )];
+    let converted = biblio::ris::parse(&biblio::ris::serialize(&records))
+        .unwrap()
+        .records;
+    assert_eq!(converted[0].database.as_deref(), Some("CINAHL"));
+}
+
 // -- Error cases --
 
 #[test]
@@ -545,7 +626,7 @@ fn serialize_skips_none_fields() {
 /// The leaf element names that the `EndNote XML` parser reads into fields. Some are read only under
 /// a particular container (`title` under `titles`, for instance), but the generator avoids them
 /// everywhere, which is simpler and only slightly over-cautious.
-const ENDNOTE_READ_LEAVES: [&str; 10] = [
+const ENDNOTE_READ_LEAVES: [&str; 11] = [
     "title",
     "author",
     "year",
@@ -556,6 +637,7 @@ const ENDNOTE_READ_LEAVES: [&str; 10] = [
     "number",
     "abstract",
     "isbn",
+    "remote-database-name",
 ];
 
 /// An element path below `<record>` that the parser does not read: one to three names, none of them
@@ -600,6 +682,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
         proptest::option::of(arb_xml_text(200)), // abstract
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"), // ISSN
+            proptest::option::of(arb_xml_text(60)),          // database
             proptest::collection::hash_map(
                 arb_unread_path(),
                 proptest::collection::vec(arb_xml_text(40), 1..=3),
@@ -618,7 +701,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, unread),
+                (isbn, database, unread),
             )| {
                 let extras: HashMap<String, Vec<String>> = unread
                     .into_iter()
@@ -636,6 +719,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                     record.number = number;
                     record.abstract_text = abstract_text;
                     record.isbn = isbn;
+                    record.database = database;
                     record.extras = extras;
                     record
                 }
@@ -771,7 +855,7 @@ fn byte_order_mark_does_not_change_result(
 const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "bibtex:note"];
 
 /// The element paths the parser reads into fields, in the form it reads them.
-const ENDNOTE_READ_PATHS: [&str; 10] = [
+const ENDNOTE_READ_PATHS: [&str; 11] = [
     "titles/title",
     "contributors/authors/author",
     "dates/year",
@@ -782,6 +866,7 @@ const ENDNOTE_READ_PATHS: [&str; 10] = [
     "number",
     "abstract",
     "isbn",
+    "remote-database-name",
 ];
 
 /// An extra whose path the parser reads into a field is never written, so it cannot leak into the
