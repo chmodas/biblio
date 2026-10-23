@@ -12,7 +12,8 @@ use quick_xml::events::{BytesCData, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 
 use crate::parse_util::{
-    check_empty, own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
+    check_empty, non_blank, non_blank_values, own_extras, parsed, push_extra, report_missing_title,
+    strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -33,12 +34,15 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// # Extras
 ///
 /// The text of every element without a field is kept in [`Record::extras`] under its element path
-/// below `<record>`, e.g. `"endnote:keywords/keyword"`, one value per element. Fields are matched
+/// below `<record>`, e.g. `"endnote:urls/pdf-urls/url"`, one value per element. Fields are matched
 /// by the end of their path: any path ending in `pages` fills the pages, for instance, while
 /// `titles/secondary-title` and `dates/pub-dates/date` become extras. A path ending in
 /// `remote-database-name` fills [`Record::database`], while `remote-database-provider` stays an
-/// extra. A path ending in `label` fills [`Record::label`]. Only elements without child elements
-/// hold values, and empty ones are skipped. Attributes, such as the name in
+/// extra. A path ending in `label` fills [`Record::label`]. Each element at a path ending in
+/// `keywords/keyword` adds one keyword to [`Record::keywords`], and each at a path ending in
+/// `urls/related-urls/url` one link to [`Record::urls`]; their values are trimmed and blank ones
+/// dropped, while other links, such as `urls/pdf-urls/url`, stay extras. Only elements without
+/// child elements hold values, and empty ones are skipped. Attributes, such as the name in
 /// `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year` that cannot be read are
 /// dropped.
 ///
@@ -244,9 +248,10 @@ impl<'a> Walker<'a> {
 /// Produces a well-formed XML document with `<xml><records>...</records></xml>` structure. Text
 /// values are CDATA-escaped. `endnote:` extras are written after the fields as nested elements, one
 /// block per key, sorted by path, with one element per non-empty value; a key may therefore add a
-/// second container such as `<titles>`. Paths with an empty or non-ASCII element name, with a
-/// `record` or `style` element, or that the parser reads into a field are skipped, so some paths
-/// that parsing produces are not written. Extras of other formats are not written.
+/// second container such as `<titles>` or `<urls>`. Paths with an empty or non-ASCII element name,
+/// with a `record` or `style` element, or that the parser reads into a field are skipped, so some
+/// paths that parsing produces are not written. Extras of other formats are not written. Blank
+/// keywords and links are skipped, and an empty list writes no container.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -340,6 +345,9 @@ fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
         write_simple_element(writer, "label", label);
     }
 
+    write_list(writer, &["keywords"], "keyword", &record.keywords);
+    write_list(writer, &["urls", "related-urls"], "url", &record.urls);
+
     // Extras of this format, one block of nested elements per key, sorted by path.
     for (path, values) in own_extras(&record.extras, "endnote") {
         let segments: Vec<&str> = path.split('/').collect();
@@ -375,6 +383,24 @@ fn is_writable_name(segment: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
         && segment != "record"
         && segment != "style"
+}
+
+/// Write the non-blank `values` as `leaf` elements nested in `containers`, or nothing if there are
+/// none.
+fn write_list(writer: &mut Writer<Vec<u8>>, containers: &[&str], leaf: &str, values: &[String]) {
+    let mut values = non_blank_values(values).peekable();
+    if values.peek().is_none() {
+        return;
+    }
+    for container in containers {
+        let _ = writer.write_event(Event::Start(BytesStart::new(*container)));
+    }
+    for value in values {
+        write_simple_element(writer, leaf, value);
+    }
+    for container in containers.iter().rev() {
+        let _ = writer.write_event(Event::End(BytesEnd::new(*container)));
+    }
 }
 
 fn write_simple_element(writer: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
@@ -458,6 +484,8 @@ struct PendingRecord {
     isbn: Option<String>,
     database: Option<String>,
     label: Option<String>,
+    keywords: Vec<String>,
+    urls: Vec<String>,
     /// Values of elements that are not read into a field, keyed `"endnote:{path}"`.
     extras: HashMap<String, Vec<String>>,
 }
@@ -476,6 +504,8 @@ enum ReadField {
     Isbn,
     Database,
     Label,
+    Keyword,
+    Url,
 }
 
 /// The field an element path below `<record>` is read into, if any. A rule written `[.., name]`
@@ -494,6 +524,8 @@ fn read_field(path: &[&str]) -> Option<ReadField> {
         [.., "isbn"] => ReadField::Isbn,
         [.., "remote-database-name"] => ReadField::Database,
         [.., "label"] => ReadField::Label,
+        [.., "keywords", "keyword"] => ReadField::Keyword,
+        [.., "urls", "related-urls", "url"] => ReadField::Url,
         _ => return None,
     })
 }
@@ -520,6 +552,8 @@ impl PendingRecord {
             Some(ReadField::Isbn) => self.isbn = value,
             Some(ReadField::Database) => self.database = value,
             Some(ReadField::Label) => self.label = value,
+            Some(ReadField::Keyword) => self.keywords.push(text.to_owned()),
+            Some(ReadField::Url) => self.urls.push(text.to_owned()),
             None => push_extra(
                 &mut self.extras,
                 format!("endnote:{}", names.join("/")),
@@ -554,6 +588,8 @@ impl PendingRecord {
             isbn: self.isbn,
             database: self.database,
             label: self.label,
+            keywords: non_blank(self.keywords),
+            urls: non_blank(self.urls),
             extras: self.extras,
         }
     }

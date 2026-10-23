@@ -5,7 +5,7 @@
 
 biblio parses and serializes **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, and **BibLaTeX** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
 
-> **Work in progress.** The current `Record` carries the minimum useful set of fields (title, authors, date, journal, DOI, pages, volume, number, abstract, ISBN/ISSN, source database, label). Additional fields – keywords, URLs, publication type, language, funding, affiliations, and more – will be added in upcoming releases.
+> **Work in progress.** The current `Record` carries the minimum useful set of fields (title, authors, date, journal, DOI, pages, volume, number, abstract, ISBN/ISSN, source database, label, keywords, URLs). Additional fields – publication type, language, funding, affiliations, and more – will be added in upcoming releases.
 
 ## Quick start
 
@@ -58,7 +58,7 @@ let rec = Record::builder()
 
 `Record`, `Parsed`, `Diagnostic` and `Error` are `#[non_exhaustive]`, so fields and variants can be added without breaking your code: build records with the builder, and give a `match` on `Diagnostic` or `Error` a wildcard arm.
 
-The title is optional, because some records have none. Every field without a slot of its own lands in `extras: HashMap<String, Vec<String>>`, keyed by format and tag (`"ris:KW"`, `"nbib:PMID"`, `"bibtex:note"`, `"endnote:keywords/keyword"`, …) with its values in order, so fields without a slot are no longer dropped. Each serialiser writes back only the extras of its own format: converting BibTeX to RIS keeps the BibTeX-only fields on the record but does not write them into the RIS.
+The title is optional, because some records have none. Every field without a slot of its own lands in `extras: HashMap<String, Vec<String>>`, keyed by format and tag (`"ris:N1"`, `"nbib:PMID"`, `"bibtex:note"`, `"endnote:urls/pdf-urls/url"`, …) with its values in order, so fields without a slot are no longer dropped. Each serialiser writes back only the extras of its own format: converting BibTeX to RIS keeps the BibTeX-only fields on the record but does not write them into the RIS.
 
 ## Errors and diagnostics
 

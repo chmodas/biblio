@@ -22,7 +22,8 @@ use winnow::ascii::space0;
 use winnow::token::{one_of, take_while};
 
 use crate::parse_util::{
-    check_empty, first_non_blank, own_extras, parsed, report_missing_title, strip_byte_order_mark,
+    check_empty, first_non_blank, non_blank, non_blank_values, own_extras, parsed,
+    report_missing_title, strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -118,6 +119,15 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// set; exporter fields such as `source` (Scopus) stay in extras. `BibLaTeX`'s `label` field is a
 /// substitute citation label, not a user's label, so [`Record::label`] is never set and `label`
 /// stays in extras.
+///
+/// # Keywords and links
+///
+/// The `keywords` field is split into [`Record::keywords`] at every `,` and `;` outside brace
+/// groups, so `{a, {Carcinoma, Squamous Cell}; b}` gives `a`, `Carcinoma, Squamous Cell` and `b`.
+/// Braces that hold the argument of a command, as in `\emph{x, y}`, do not protect a separator. The
+/// `url` field gives at most one link in [`Record::urls`]. Values are trimmed, and blank ones are
+/// dropped. A `crossref` child inherits its parent's `url`, but the underlying parser never passes
+/// `keywords` on, so a child has only its own keywords.
 ///
 /// # Identifiers
 ///
@@ -305,6 +315,11 @@ fn lines_of(input: &str, offsets: &[usize]) -> Vec<usize> {
 /// `ids` alias, or through other entries) is skipped too, because such an entry cannot be resolved.
 /// Extras of other formats are not written, nor are [`Record::database`] and [`Record::label`].
 ///
+/// Keywords are written as one `keywords` field, joined with `, `, with every `,` and `;` inside a
+/// keyword wrapped in braces (`Carcinoma{,} Squamous Cell`) so that it is not split when read
+/// back. Only the first link is written, as `url`, because a field appears once in an entry. Blank
+/// keywords and links are skipped.
+///
 /// Values are escaped so that braces, backslashes and `$` read back unchanged: `\`, `{` and `}`
 /// everywhere, and `$` except in verbatim fields such as `url` and `doi`. The parser still turns
 /// `--` into a dash and collapses whitespace.
@@ -375,6 +390,17 @@ pub fn serialize(records: &[Record]) -> String {
 
         if let Some(isbn) = &record.isbn {
             emit(&mut out, "isbn", isbn);
+        }
+
+        let keywords: Vec<String> = non_blank_values(&record.keywords)
+            .map(|keyword| protect_separators(&escape("keywords", keyword)))
+            .collect();
+        if !keywords.is_empty() {
+            write_field(&mut out, "keywords", &keywords.join(", "));
+        }
+
+        if let Some(url) = non_blank_values(&record.urls).next() {
+            emit(&mut out, "url", url);
         }
 
         for (name, values) in own_extras(&record.extras, "bibtex") {
@@ -466,6 +492,12 @@ const VERBATIM_FIELDS: [&str; 10] = [
 
 /// Write one field, escaping the value so that it reads back unchanged.
 fn emit(out: &mut String, field: &str, value: &str) {
+    write_field(out, field, &escape(field, value));
+}
+
+/// Escape `value` for `field`, so that it reads back unchanged: `\`, `{` and `}` always, and `$`
+/// unless the field is verbatim.
+fn escape(field: &str, value: &str) -> String {
     let verbatim = VERBATIM_FIELDS.contains(&field);
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
@@ -474,7 +506,48 @@ fn emit(out: &mut String, field: &str, value: &str) {
         }
         escaped.push(c);
     }
+    escaped
+}
+
+/// Write one field whose value is already escaped.
+fn write_field(out: &mut String, field: &str, escaped: &str) {
     let _ = writeln!(out, "  {field} = {{{escaped}}},");
+}
+
+/// Wrap every `,` and `;` of an escaped keyword in braces, so that reading the `keywords` field
+/// back does not split the keyword there.
+fn protect_separators(escaped: &str) -> String {
+    let mut protected = String::with_capacity(escaped.len());
+    for c in escaped.chars() {
+        if matches!(c, ',' | ';') {
+            protected.push('{');
+            protected.push(c);
+            protected.push('}');
+        } else {
+            protected.push(c);
+        }
+    }
+    protected
+}
+
+/// Split the chunks of a `keywords` field into keywords at every `,` and `;` outside brace groups,
+/// then trim them and drop the blank ones. A brace group, and math, belong whole to the keyword
+/// they appear in. The underlying parser keeps a command and its braced argument in normal text,
+/// so a separator inside such an argument still splits.
+fn split_keywords(chunks: &[Spanned<Chunk>]) -> Vec<String> {
+    let mut keywords = vec![String::new()];
+    for chunk in chunks {
+        if let Chunk::Normal(text) = &chunk.v {
+            let mut pieces = text.split([',', ';']);
+            if let (Some(first), Some(current)) = (pieces.next(), keywords.last_mut()) {
+                current.push_str(first);
+            }
+            keywords.extend(pieces.map(str::to_owned));
+        } else if let Some(current) = keywords.last_mut() {
+            current.push_str(&std::slice::from_ref(chunk).format_verbatim());
+        }
+    }
+    non_blank(keywords)
 }
 
 /// Whether the parser reads field `name` into a first-class field, or `biblatex` consumes it while
@@ -496,6 +569,8 @@ fn is_read_field(name: &str) -> bool {
             | "abstract"
             | "isbn"
             | "issn"
+            | "keywords"
+            | "url"
             | "xdata"
     )
 }
@@ -596,6 +671,8 @@ fn record_from_entry(
             .map(|chunks| chunks.format_verbatim().trim().to_owned())
     };
     let isbn = first_non_blank([field("isbn"), field("issn")]);
+    let keywords = entry.get("keywords").map_or_else(Vec::new, split_keywords);
+    let urls = non_blank(field("url").into_iter().collect());
 
     Record {
         title,
@@ -610,6 +687,8 @@ fn record_from_entry(
         isbn,
         database: None,
         label: None,
+        keywords,
+        urls,
         extras,
     }
 }

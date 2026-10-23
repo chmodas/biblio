@@ -10,7 +10,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::bibtex::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_date, first_extra};
+use common::{arb_blank, arb_date, arb_keyword, arb_url, first_extra};
 
 // -- Core parsing --
 
@@ -603,6 +603,127 @@ fn label_never_set() {
     assert_eq!(first_extra(&record, "bibtex:label"), Some("Doe24"));
 }
 
+// -- Keywords and links --
+
+/// Parse a single entry whose fields, after the title, are `field_lines`.
+fn entry_of(field_lines: &str) -> Record {
+    let input = format!("@article{{k,\n  title = {{t}},\n{field_lines}}}\n");
+    parse(&input).unwrap().records.remove(0)
+}
+
+/// The `keywords` field is split at commas and semicolons, and is not kept in extras.
+#[test]
+fn keywords_split_on_commas_and_semicolons() {
+    let record = entry_of("  keywords = {cats, dogs; mice},\n");
+    assert_eq!(record.keywords, vec!["cats", "dogs", "mice"]);
+    assert!(!record.extras.contains_key("bibtex:keywords"));
+}
+
+/// Blank keywords between separators are dropped.
+#[test]
+fn blank_keywords_dropped() {
+    let record = entry_of("  keywords = {a, , b;},\n");
+    assert_eq!(record.keywords, vec!["a", "b"]);
+}
+
+/// A comma inside braces does not split the keyword.
+#[test]
+fn braced_keyword_not_split() {
+    let record = entry_of("  keywords = {a, {Carcinoma, Squamous Cell}},\n");
+    assert_eq!(record.keywords, vec!["a", "Carcinoma, Squamous Cell"]);
+}
+
+/// A keyword holding a comma or semicolon is written with that separator in braces, so it reads
+/// back whole.
+#[test]
+fn keyword_with_comma_written_braced() {
+    let record = Record::builder()
+        .title("t")
+        .extra("bibtex:@key", "k")
+        .extra("bibtex:@type", "article")
+        .keywords(["Carcinoma, Squamous Cell", "a; b", "plain"])
+        .build();
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(
+        output.contains("keywords = {Carcinoma{,} Squamous Cell, a{;} b, plain}"),
+        "{output}"
+    );
+    assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// Braces that hold a command's argument do not protect a separator: the underlying parser keeps
+/// the command in normal text.
+#[test]
+fn command_argument_does_not_protect_separator() {
+    let record = entry_of("  keywords = {a, \\textit{x,y}, b},\n");
+    assert_eq!(record.keywords, vec!["a", "\\textit{x", "y}", "b"]);
+}
+
+/// Keywords holding braces, backslashes, dollar signs and separators together read back
+/// unchanged: escaping and bracing the separators do not interfere.
+#[test]
+fn escaped_keyword_with_separators_round_trips() {
+    let record = Record::builder()
+        .title("t")
+        .extra("bibtex:@key", "k")
+        .extra("bibtex:@type", "article")
+        .keywords(["a\\{,b", "x$y,z$", "c}; d\\"])
+        .build();
+    let output = serialize(std::slice::from_ref(&record));
+    assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// A `crossref` child inherits its parent's link, but not its keywords, which the underlying parser
+/// never passes on.
+#[test]
+fn crossref_child_inherits_url_but_not_keywords() {
+    let input = "@book{p, title = {P}, keywords = {pa, pb}, url = {https://p.org}}\n\
+                 @inbook{c, title = {C}, crossref = {p}}\n";
+    let records = parse(input).unwrap().records;
+    let child = records
+        .iter()
+        .find(|r| r.title.as_deref() == Some("C"))
+        .unwrap();
+    assert_eq!(child.keywords, Vec::<String>::new());
+    assert_eq!(child.urls, vec!["https://p.org"]);
+}
+
+/// The `url` field gives one link, and is not kept in extras.
+#[test]
+fn url_read() {
+    let record = entry_of("  url = {https://example.org/a?x=1&y=%2f},\n");
+    assert_eq!(record.urls, vec!["https://example.org/a?x=1&y=%2f"]);
+    assert!(!record.extras.contains_key("bibtex:url"));
+}
+
+/// A blank `url` gives no link.
+#[test]
+fn blank_url_gives_no_url() {
+    assert_eq!(entry_of("  url = {},\n").urls, Vec::<String>::new());
+}
+
+/// A field holds one value, so only the first non-blank link is written.
+#[test]
+fn serialize_writes_only_first_url() {
+    let record = Record::builder()
+        .title("t")
+        .urls([" ", "https://example.org/a", "https://example.org/b"])
+        .build();
+    let output = serialize(&[record]);
+    assert!(
+        output.contains("  url = {https://example.org/a},\n"),
+        "{output}"
+    );
+    assert!(!output.contains("example.org/b"));
+}
+
+/// The underlying parser turns `--` into a dash in every field, links included.
+#[test]
+fn double_hyphen_in_url_becomes_dash() {
+    let record = entry_of("  url = {https://example.org/a--b},\n");
+    assert_eq!(record.urls, vec!["https://example.org/a\u{2013}b"]);
+}
+
 // -- Identifiers --
 
 /// Parse a single entry whose fields, after the title, are `field_lines`, and return its
@@ -801,7 +922,7 @@ fn parenthesised_entry_skipped() {
 /// `bibtex:@key` and `bibtex:@type`.
 #[test]
 fn unread_fields_kept_in_extras() {
-    let input = "@book{k1, title = {T}, note = {A note}, Publisher = {Pub}, keywords = {a, b}}\n";
+    let input = "@book{k1, title = {T}, note = {A note}, Publisher = {Pub}, urldate = {2024}}\n";
     let records = parse(input).unwrap().records;
     let extras = &records[0].extras;
     assert_eq!(extras["bibtex:@key"], vec!["k1"]);
@@ -809,7 +930,7 @@ fn unread_fields_kept_in_extras() {
     assert_eq!(extras["bibtex:note"], vec!["A note"]);
     // Field names are lower-cased.
     assert_eq!(extras["bibtex:publisher"], vec!["Pub"]);
-    assert_eq!(extras["bibtex:keywords"], vec!["a, b"]);
+    assert_eq!(extras["bibtex:urldate"], vec!["2024"]);
     assert_eq!(extras.len(), 5);
 }
 
@@ -1123,7 +1244,7 @@ fn serialize_escapes_values() {
         .extra("bibtex:@key", "k")
         .extra("bibtex:@type", "article")
         .extra("bibtex:note", "costs $5, ends with \\")
-        .extra("bibtex:url", "https://example.org/$id")
+        .url("https://example.org/$id")
         .build();
     let output = serialize(std::slice::from_ref(&record));
     assert!(
@@ -1258,8 +1379,8 @@ fn date_display() {
 
 /// Fields the generator never uses as extras: the fields the `BibTeX` parser reads (a copy of its
 /// list), `xdata` (consumed while resolving), and `crossref`, `ids` and `set`, which refer to other
-/// entries.
-const BIBTEX_RESERVED_FIELDS: [&str; 17] = [
+/// entries. The first 16 are the ones the parser reads or consumes.
+const BIBTEX_RESERVED_FIELDS: [&str; 19] = [
     "title",
     "author",
     "date",
@@ -1273,6 +1394,8 @@ const BIBTEX_RESERVED_FIELDS: [&str; 17] = [
     "abstract",
     "isbn",
     "issn",
+    "keywords",
+    "url",
     "xdata",
     "crossref",
     "ids",
@@ -1397,6 +1520,8 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
             "[a-z]{1,10}[0-9]{4}", // citation key
             arb_entry_type(),
             arb_bibtex_unread_fields(),
+            vec(arb_keyword(), 0..4),
+            proptest::option::of(arb_url()),
         ),
     )
         .prop_map(
@@ -1410,7 +1535,7 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, key, entry_type, unread),
+                (isbn, key, entry_type, unread, keywords, url),
             )| {
                 let mut extras: HashMap<String, Vec<String>> = unread
                     .into_iter()
@@ -1430,6 +1555,8 @@ fn arb_bibtex_record() -> impl Strategy<Value = Record> {
                     record.number = number;
                     record.abstract_text = abstract_text;
                     record.isbn = isbn;
+                    record.keywords = keywords;
+                    record.urls = url.into_iter().collect();
                     record.extras = extras;
                     record
                 }
@@ -1640,7 +1767,7 @@ const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "endnote:keywords/keyword"
 /// written, so it cannot leak into a field.
 #[proptest]
 fn read_fields_never_written_from_extras(
-    #[strategy(proptest::sample::select(BIBTEX_RESERVED_FIELDS[..14].to_vec()))] name: &'static str,
+    #[strategy(proptest::sample::select(BIBTEX_RESERVED_FIELDS[..16].to_vec()))] name: &'static str,
     #[strategy(arb_bibtex_record())] record: Record,
 ) {
     let mut with_read_field = record.clone();
@@ -3376,4 +3503,53 @@ fn date_like_values_never_panic(input: DateInput) {
     let parsed = parse(&source);
     prop_assert!(parsed.is_ok());
     prop_assert_eq!(PANICS.with(std::cell::Cell::get), before, "{}", source);
+}
+
+/// A piece of a `keywords` field: blank, a few words, or words with a comma inside braces.
+fn arb_keyword_piece() -> impl Strategy<Value = (String, bool)> {
+    prop_oneof![
+        Just((String::new(), false)),
+        ("[A-Za-z0-9]{1,6}( [A-Za-z0-9]{1,6}){0,2}", Just(false)),
+        ("[A-Za-z0-9]{1,6}, [A-Za-z0-9]{1,6}", Just(true)),
+    ]
+}
+
+/// A `keywords` field of pieces joined by commas and semicolons, with or without spaces, gives the
+/// trimmed non-blank pieces in order, and a braced piece stays whole.
+#[proptest]
+fn keywords_split_matches_reference(
+    #[strategy(vec((arb_keyword_piece(), proptest::sample::select(&[",", ";", ", ", " ; "])), 1..6))]
+    pieces: Vec<((String, bool), &'static str)>,
+) {
+    let mut field = String::new();
+    for ((text, braced), separator) in &pieces {
+        if *braced {
+            write!(field, "{{{text}}}").unwrap();
+        } else {
+            field.push_str(text);
+        }
+        field.push_str(separator);
+    }
+    let record = entry_of(&format!("  keywords = {{{field}}},\n"));
+
+    let reference: Vec<&str> = pieces
+        .iter()
+        .map(|((text, _), _)| text.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    prop_assert_eq!(record.keywords, reference);
+}
+
+/// Blank keywords and links are not written, wherever they are in the list.
+#[proptest]
+fn blank_list_values_not_written(
+    #[strategy(arb_bibtex_record())] record: Record,
+    #[strategy(arb_blank())] blank: String,
+) {
+    let mut with_blanks = record.clone();
+    for list in [&mut with_blanks.keywords, &mut with_blanks.urls] {
+        list.insert(0, blank.clone());
+        list.push(blank.clone());
+    }
+    prop_assert_eq!(serialize(&[with_blanks]), serialize(&[record]));
 }
