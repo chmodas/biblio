@@ -10,7 +10,10 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::ris::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume, first_extra};
+use common::{
+    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_raw_value, arb_text, arb_url,
+    arb_volume, first_extra,
+};
 
 // -- Core parsing --
 
@@ -152,17 +155,17 @@ fn unknown_tags_kept_in_extras() {
     let input = "\
 TY  - BOOK
 TI  - A test title
-KW  - keyword one
-KW  - keyword two
-N1  - some note
+N1  - note one
+N1  - note two
+AD  - an address
 ER  -
 ";
     let records = parse(input).unwrap().records;
     assert_eq!(records[0].title.as_deref(), Some("A test title"));
     let extras = &records[0].extras;
     assert_eq!(extras["ris:TY"], vec!["BOOK"]);
-    assert_eq!(extras["ris:KW"], vec!["keyword one", "keyword two"]);
-    assert_eq!(extras["ris:N1"], vec!["some note"]);
+    assert_eq!(extras["ris:N1"], vec!["note one", "note two"]);
+    assert_eq!(extras["ris:AD"], vec!["an address"]);
     assert_eq!(extras.len(), 3);
 }
 
@@ -756,6 +759,90 @@ fn serialize_writes_lb() {
     );
 }
 
+// -- Keywords and links --
+
+/// Each `KW` adds a keyword and each `UR` a link, in order; `KW` and `UR` are not kept in extras.
+#[test]
+fn kw_and_ur_read_in_order() {
+    let input = "\
+TY  - JOUR
+TI  - t
+KW  - cats
+UR  - https://example.org/a
+KW  - dogs
+UR  - https://example.org/b
+ER  -
+";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.keywords, vec!["cats", "dogs"]);
+    assert_eq!(
+        record.urls,
+        vec!["https://example.org/a", "https://example.org/b"]
+    );
+    assert!(!record.extras.contains_key("ris:KW"));
+    assert!(!record.extras.contains_key("ris:UR"));
+}
+
+/// A continuation line of `KW` is joined to the keyword, as for every other tag, even when an
+/// export lists one keyword per line under a single `KW`.
+#[test]
+fn kw_continuation_joined() {
+    let input = "\
+TY  - JOUR
+TI  - t
+KW  - Access
+Cancer
+ER  -
+";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.keywords, vec!["Access Cancer"]);
+}
+
+/// A blank `KW` continued on the next line gives that line as the keyword, not an addition to the
+/// keyword before it.
+#[test]
+fn blank_kw_continued_gives_that_keyword() {
+    let input = "TY  - JOUR\nTI  - t\nKW  - cats\nKW  -\n  dogs\nER  -\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.keywords, vec!["cats", "dogs"]);
+}
+
+/// Blank `KW` and `UR` tags add nothing.
+#[test]
+fn blank_kw_and_ur_dropped() {
+    let input = "TY  - JOUR\nTI  - t\nKW  -\nUR  -   \nKW  - cats\nER  -\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.keywords, vec!["cats"]);
+    assert_eq!(record.urls, Vec::<String>::new());
+}
+
+/// Links other than `UR`, such as the file link `L1`, stay in extras.
+#[test]
+fn l1_kept_in_extras() {
+    let input = "TY  - JOUR\nTI  - t\nL1  - internal-pdf://paper.pdf\nER  -\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.urls, Vec::<String>::new());
+    assert_eq!(
+        first_extra(&record, "ris:L1"),
+        Some("internal-pdf://paper.pdf")
+    );
+}
+
+/// Keywords are written as `KW` and links as `UR`, after `LB`, skipping blank values.
+#[test]
+fn serialize_writes_kw_and_ur_after_lb() {
+    let record = Record::builder()
+        .title("T")
+        .label("OLD")
+        .keywords(["cats", " ", "dogs"])
+        .urls(["", "https://example.org"])
+        .build();
+    assert_eq!(
+        serialize(&[record]),
+        "TY  - JOUR\nTI  - T\nLB  - OLD\nKW  - cats\nKW  - dogs\nUR  - https://example.org\nER  -\n"
+    );
+}
+
 // -- Error cases --
 
 #[test]
@@ -860,12 +947,12 @@ fn continuation_of_unread_tag_not_reported() {
 fn serialize_writes_only_ris_extras() {
     let record = Record::builder()
         .title("T")
-        .extra("ris:KW", "cats")
+        .extra("ris:N1", "cats")
         .extra("bibtex:note", "a note")
         .extra("nbib:OT", "other term")
         .build();
     let output = serialize(&[record]);
-    assert!(output.contains("KW  - cats\n"));
+    assert!(output.contains("N1  - cats\n"));
     assert!(!output.contains("a note"));
     assert!(!output.contains("other term"));
 }
@@ -942,9 +1029,9 @@ fn format_ris_date(date: PublicationDate) -> String {
 
 /// The tags the `RIS` parser reads into fields or record structure. A copy of the parser's list, so
 /// that the tests pin it.
-const RIS_READ_TAGS: [&str; 24] = [
+const RIS_READ_TAGS: [&str; 26] = [
     "TY", "ER", "TI", "T1", "AU", "A1", "PY", "Y1", "DO", "SP", "EP", "VL", "IS", "AB", "N2", "SN",
-    "DB", "LB", "JF", "T2", "JO", "JA", "J2", "J1",
+    "DB", "LB", "JF", "T2", "JO", "JA", "J2", "J1", "KW", "UR",
 ];
 
 /// Extras as `RIS` parsing produces them: a record type, and up to four tags the parser does not
@@ -982,6 +1069,8 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
             proptest::option::of(arb_text(60)),
             proptest::option::of(arb_text(60)),
+            vec(arb_keyword(), 0..4),
+            vec(arb_url(), 0..3),
             arb_ris_extras(),
         ),
     )
@@ -996,7 +1085,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, database, label, extras),
+                (isbn, database, label, keywords, urls, extras),
             )| {
                 {
                     let mut record = Record::default();
@@ -1012,6 +1101,8 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                     record.isbn = isbn;
                     record.database = database;
                     record.label = label;
+                    record.keywords = keywords;
+                    record.urls = urls;
                     record.extras = extras;
                     record
                 }
@@ -1142,7 +1233,8 @@ const CONTINUATION_TEXT: &str = "[^\\s\\p{C}-][^\\p{C}-]{0,59}";
 #[proptest]
 fn blank_field_continued_is_continuation_text(
     #[strategy(select(&[
-        "TI", "T1", "AB", "N2", "AU", "A1", "DB", "LB", "JF", "T2", "JO", "JA", "J2", "J1",
+        "TI", "T1", "AB", "N2", "AU", "A1", "DB", "LB", "KW", "UR", "JF", "T2", "JO", "JA", "J2",
+        "J1",
     ]))]
     tag: &'static str,
     #[strategy(CONTINUATION_TEXT)] text: String,
@@ -1162,6 +1254,8 @@ fn blank_field_continued_is_continuation_text(
         "AU" | "A1" => record.authors.last().cloned(),
         "DB" => record.database,
         "LB" => record.label,
+        "KW" => record.keywords.last().cloned(),
+        "UR" => record.urls.last().cloned(),
         _ => record.journal,
     };
     prop_assert_eq!(field.as_deref(), Some(text.trim()));
@@ -1316,6 +1410,50 @@ fn foreign_extras_not_written(
             .insert(key.to_owned(), vec![value.clone()]);
     }
     prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// `KW` and `UR` lines with raw values, in any mix, give the trimmed non-blank values of each tag
+/// in order, and the record comes back unchanged when written and read again.
+#[proptest]
+fn keywords_and_urls_match_reference(
+    #[strategy(vec((select(&["KW", "UR"]), arb_raw_value()), 0..8))] lines: Vec<(
+        &'static str,
+        String,
+    )>,
+) {
+    let mut input = String::from("TY  - JOUR\nTI  - A title\n");
+    for (tag, value) in &lines {
+        writeln!(input, "{tag}  - {value}").unwrap();
+    }
+    input.push_str("ER  -\n");
+    let first = parse(&input).unwrap().records;
+
+    let reference = |wanted: &str| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|(tag, _)| *tag == wanted)
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    prop_assert_eq!(&first[0].keywords, &reference("KW"));
+    prop_assert_eq!(&first[0].urls, &reference("UR"));
+    prop_assert_eq!(parse(&serialize(&first)).unwrap().records, first);
+}
+
+/// Blank keywords and links are not written, wherever they are in the list.
+#[proptest]
+fn blank_list_values_not_written(
+    #[strategy(arb_ris_record())] record: Record,
+    #[strategy(arb_blank())] blank: String,
+) {
+    let mut with_blanks = record.clone();
+    for list in [&mut with_blanks.keywords, &mut with_blanks.urls] {
+        list.insert(0, blank.clone());
+        list.push(blank.clone());
+    }
+    prop_assert_eq!(serialize(&[with_blanks]), serialize(&[record]));
 }
 
 /// Records read from source text with arbitrary unread tags and values come back unchanged when

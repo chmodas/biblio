@@ -8,7 +8,9 @@ use test_strategy::proptest;
 use biblio::endnote_xml::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_volume, first_extra};
+use common::{
+    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_url, arb_volume, first_extra,
+};
 
 // -- Core parsing --
 
@@ -279,15 +281,13 @@ fn unread_elements_kept_by_path() {
   <urls><related-urls><url>https://example.org</url></related-urls></urls>
 </record></records></xml>"#;
     let records = parse(input).unwrap().records;
+    // Keywords and related links have fields of their own.
+    assert_eq!(records[0].keywords, vec!["cats", "dogs"]);
+    assert_eq!(records[0].urls, vec!["https://example.org"]);
     let extras = &records[0].extras;
     assert_eq!(extras["endnote:ref-type"], vec!["17"]);
     assert_eq!(extras["endnote:titles/secondary-title"], vec!["Nature"]);
-    assert_eq!(extras["endnote:keywords/keyword"], vec!["cats", "dogs"]);
-    assert_eq!(
-        extras["endnote:urls/related-urls/url"],
-        vec!["https://example.org"]
-    );
-    assert_eq!(extras.len(), 4);
+    assert_eq!(extras.len(), 2);
 }
 
 // -- Source database --
@@ -430,6 +430,90 @@ fn label_carried_from_endnote_to_ris() {
         .unwrap()
         .records;
     assert_eq!(converted[0].label.as_deref(), Some("Drummond2017"));
+}
+
+// -- Keywords and links --
+
+/// Each `keywords/keyword` element adds a keyword, with the style tags `EndNote` wraps it in
+/// removed, and keywords are not kept in extras.
+#[test]
+fn keywords_read_with_style_tags() {
+    let record = parse_record(
+        r#"<keywords><keyword><style face="normal" font="default" size="100%">Animals</style></keyword><keyword>anatomy &amp; histology</keyword></keywords>"#,
+    );
+    assert_eq!(record.keywords, vec!["Animals", "anatomy & histology"]);
+    assert!(!record.extras.contains_key("endnote:keywords/keyword"));
+}
+
+/// A keyword of only whitespace is dropped.
+#[test]
+fn whitespace_only_keyword_dropped() {
+    let record =
+        parse_record("<keywords><keyword>  </keyword><keyword> cats </keyword></keywords>");
+    assert_eq!(record.keywords, vec!["cats"]);
+}
+
+/// Each `urls/related-urls/url` element adds a link, and links are not kept in extras.
+#[test]
+fn related_urls_read() {
+    let record = parse_record(
+        "<urls><related-urls><url>https://example.org/a</url><url>https://example.org/b</url></related-urls></urls>",
+    );
+    assert_eq!(
+        record.urls,
+        vec!["https://example.org/a", "https://example.org/b"]
+    );
+    assert!(!record.extras.contains_key("endnote:urls/related-urls/url"));
+}
+
+/// Links to files are not related links, and stay in extras.
+#[test]
+fn pdf_urls_kept_in_extras() {
+    let record = parse_record("<urls><pdf-urls><url>internal-pdf://a.pdf</url></pdf-urls></urls>");
+    assert_eq!(record.urls, Vec::<String>::new());
+    assert_eq!(
+        first_extra(&record, "endnote:urls/pdf-urls/url"),
+        Some("internal-pdf://a.pdf")
+    );
+}
+
+/// Keywords and links are written after `<label>`, each list in one container, skipping blank
+/// values.
+#[test]
+fn serialize_writes_keywords_and_urls_after_label() {
+    let record = Record::builder()
+        .title("T")
+        .label("OLD")
+        .keywords(["cats", " ", "dogs"])
+        .url("https://example.org")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains(
+        "<label>OLD</label><keywords><keyword>cats</keyword><keyword>dogs</keyword></keywords>\
+         <urls><related-urls><url>https://example.org</url></related-urls></urls></record>"
+    ));
+}
+
+/// A list with no non-blank values writes no container.
+#[test]
+fn empty_lists_not_written() {
+    let record = Record::builder().title("T").keyword("").url("  ").build();
+    let output = serialize(&[record]);
+    assert!(!output.contains("<keywords>"));
+    assert!(!output.contains("<urls>"));
+}
+
+/// Keywords and links read from `EndNote XML` are carried through a conversion to `RIS` and back.
+#[test]
+fn keywords_and_urls_carried_to_ris() {
+    let records = vec![parse_record(
+        "<keywords><keyword>cats</keyword></keywords><urls><related-urls><url>https://example.org</url></related-urls></urls>",
+    )];
+    let converted = biblio::ris::parse(&biblio::ris::serialize(&records))
+        .unwrap()
+        .records;
+    assert_eq!(converted[0].keywords, vec!["cats"]);
+    assert_eq!(converted[0].urls, vec!["https://example.org"]);
 }
 
 // -- Error cases --
@@ -578,6 +662,7 @@ fn container_of_empty_elements_has_no_value() {
 </record>
 </records></xml>";
     let records = parse(input).unwrap().records;
+    assert_eq!(records[0].urls, Vec::<String>::new());
     assert!(
         !records[0].extras.contains_key("endnote:urls"),
         "{:?}",
@@ -599,13 +684,13 @@ fn nested_record_extras_relative_to_inner_record() {
 fn serialize_writes_extras_as_nested_elements() {
     let record = Record::builder()
         .title("T")
-        .extra("endnote:keywords/keyword", "cats")
-        .extra("endnote:keywords/keyword", "dogs")
+        .extra("endnote:urls/pdf-urls/url", "a.pdf")
+        .extra("endnote:urls/pdf-urls/url", "b.pdf")
         .extra("endnote:ref-type", "17")
         .extra("ris:KW", "not written")
         .build();
     let output = serialize(std::slice::from_ref(&record));
-    assert!(output.contains("<keywords><keyword>cats</keyword><keyword>dogs</keyword></keywords>"));
+    assert!(output.contains("<urls><pdf-urls><url>a.pdf</url><url>b.pdf</url></pdf-urls></urls>"));
     assert!(!output.contains("not written"));
     let mut expected = record;
     expected.extras.remove("ris:KW");
@@ -659,7 +744,7 @@ fn serialize_skips_none_fields() {
 /// The leaf element names that the `EndNote XML` parser reads into fields. Some are read only under
 /// a particular container (`title` under `titles`, for instance), but the generator avoids them
 /// everywhere, which is simpler and only slightly over-cautious.
-const ENDNOTE_READ_LEAVES: [&str; 12] = [
+const ENDNOTE_READ_LEAVES: [&str; 14] = [
     "title",
     "author",
     "year",
@@ -672,6 +757,8 @@ const ENDNOTE_READ_LEAVES: [&str; 12] = [
     "isbn",
     "remote-database-name",
     "label",
+    "keyword",
+    "url",
 ];
 
 /// An element path below `<record>` that the parser does not read: one to three names, none of them
@@ -718,6 +805,8 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"), // ISSN
             proptest::option::of(arb_xml_text(60)),          // database
             proptest::option::of(arb_xml_text(60)),          // label
+            proptest::collection::vec(arb_keyword(), 0..4),
+            proptest::collection::vec(arb_url(), 0..3),
             proptest::collection::hash_map(
                 arb_unread_path(),
                 proptest::collection::vec(arb_xml_text(40), 1..=3),
@@ -736,7 +825,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, database, label, unread),
+                (isbn, database, label, keywords, urls, unread),
             )| {
                 let extras: HashMap<String, Vec<String>> = unread
                     .into_iter()
@@ -756,6 +845,8 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                     record.isbn = isbn;
                     record.database = database;
                     record.label = label;
+                    record.keywords = keywords;
+                    record.urls = urls;
                     record.extras = extras;
                     record
                 }
@@ -891,7 +982,7 @@ fn byte_order_mark_does_not_change_result(
 const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "bibtex:note"];
 
 /// The element paths the parser reads into fields, in the form it reads them.
-const ENDNOTE_READ_PATHS: [&str; 12] = [
+const ENDNOTE_READ_PATHS: [&str; 14] = [
     "titles/title",
     "contributors/authors/author",
     "dates/year",
@@ -904,6 +995,8 @@ const ENDNOTE_READ_PATHS: [&str; 12] = [
     "isbn",
     "remote-database-name",
     "label",
+    "keywords/keyword",
+    "urls/related-urls/url",
 ];
 
 /// An extra whose path the parser reads into a field is never written, so it cannot leak into the
@@ -971,4 +1064,37 @@ fn records_stable_through_serialize(
     prop_assert_eq!(extra_values, elements.len());
     let second = parse(&serialize(&first)).unwrap().records;
     prop_assert_eq!(second, first);
+}
+
+/// Blank keywords and links are not written, wherever they are in the list.
+#[proptest]
+fn blank_list_values_not_written(
+    #[strategy(arb_endnote_record())] record: Record,
+    #[strategy(arb_blank())] blank: String,
+) {
+    let mut with_blanks = record.clone();
+    for list in [&mut with_blanks.keywords, &mut with_blanks.urls] {
+        list.insert(0, blank.clone());
+        list.push(blank.clone());
+    }
+    prop_assert_eq!(serialize(&[with_blanks]), serialize(&[record]));
+}
+
+/// Keyword elements with raw values give their trimmed non-blank values in order.
+#[proptest]
+fn keywords_match_reference(
+    #[strategy(proptest::collection::vec("[ \\t\\u{a0}\\u{3000}]{0,2}[A-Za-z0-9 ]{0,12}", 0..6))]
+    values: Vec<String>,
+) {
+    let mut elements = String::new();
+    for value in &values {
+        write!(elements, "<keyword>{value}</keyword>").unwrap();
+    }
+    let record = parse_record(&format!("<keywords>{elements}</keywords>"));
+    let reference: Vec<&str> = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    prop_assert_eq!(record.keywords, reference);
 }

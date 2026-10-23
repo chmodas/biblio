@@ -23,9 +23,13 @@ fn builder_sets_every_field() {
         .isbn("1234-5678")
         .database("Scopus")
         .label("OLD")
+        .keyword("cats")
+        .keywords(["dogs", "mice"])
+        .url("https://example.org/a")
+        .urls(["https://example.org/b"])
         .extra("nbib:PMID", "123")
-        .extra("ris:KW", "cats")
-        .extra("ris:KW", "dogs")
+        .extra("ris:N1", "cats")
+        .extra("ris:N1", "dogs")
         .build();
 
     assert_eq!(record.title.as_deref(), Some("A title"));
@@ -43,8 +47,13 @@ fn builder_sets_every_field() {
     assert_eq!(record.isbn.as_deref(), Some("1234-5678"));
     assert_eq!(record.database.as_deref(), Some("Scopus"));
     assert_eq!(record.label.as_deref(), Some("OLD"));
+    assert_eq!(record.keywords, vec!["cats", "dogs", "mice"]);
+    assert_eq!(
+        record.urls,
+        vec!["https://example.org/a", "https://example.org/b"]
+    );
     assert_eq!(record.extras["nbib:PMID"], vec!["123"]);
-    assert_eq!(record.extras["ris:KW"], vec!["cats", "dogs"]);
+    assert_eq!(record.extras["ris:N1"], vec!["cats", "dogs"]);
 }
 
 /// A builder with nothing set gives the empty record.

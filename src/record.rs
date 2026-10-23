@@ -133,17 +133,36 @@ pub struct Record {
     /// `EndNote XML` ignores an empty element.
     pub label: Option<String>,
 
+    /// Keywords and subject headings, in source order (e.g. `"Alzheimer Disease"`).
+    ///
+    /// `RIS` reads and writes them as `KW`, `EndNote XML` as `keywords/keyword`, and `BibTeX` as
+    /// one `keywords` field, split on `,` and `;` outside brace groups and written with each `,`
+    /// and `;` inside a keyword in braces. `NBIB` reads them from `OT` and from the subject
+    /// headings in `MH`, and writes them all as `OT`. Values are trimmed and blank ones dropped;
+    /// duplicates are kept. Serialisers skip blank values. `BibTeX` turns `--` into a dash and
+    /// collapses whitespace in `keywords`, as in every field.
+    pub keywords: Vec<String>,
+
+    /// Links to the record, in source order (e.g. `"https://doi.org/10.1000/xyz"`).
+    ///
+    /// `RIS` reads and writes them as `UR`, `EndNote XML` as `urls/related-urls/url`, and `BibTeX`
+    /// as `url`, which holds one link, so only the first is written. `NBIB` has no tag for links,
+    /// so it never sets them or writes them. Values are trimmed and blank ones dropped;
+    /// duplicates are kept. Serialisers skip blank values. `BibTeX` turns `--` into a dash and
+    /// collapses whitespace in `url`, as in every field.
+    pub urls: Vec<String>,
+
     /// Every field of the source that has no slot above, keyed by format and tag, with its values
     /// in source order.
     ///
     /// Keys have the form `"{format}:{tag}"`, so values from different formats never collide:
     ///
-    /// - `RIS`: `"ris:KW"`, `"ris:UR"`, …, plus `"ris:TY"` for the record type.
-    /// - `NBIB`: `"nbib:PMID"`, `"nbib:OT"`, ….
-    /// - `BibTeX`: `"bibtex:note"`, `"bibtex:keywords"`, … (field names in lower case), plus
+    /// - `RIS`: `"ris:N1"`, `"ris:L1"`, …, plus `"ris:TY"` for the record type.
+    /// - `NBIB`: `"nbib:PMID"`, `"nbib:GR"`, ….
+    /// - `BibTeX`: `"bibtex:note"`, `"bibtex:urldate"`, … (field names in lower case), plus
     ///   `"bibtex:@key"` for the citation key and `"bibtex:@type"` for the entry type. A field name
     ///   cannot contain `@`, so these never clash with a real field.
-    /// - `EndNote XML`: the element path below `<record>`, e.g. `"endnote:keywords/keyword"`.
+    /// - `EndNote XML`: the element path below `<record>`, e.g. `"endnote:urls/pdf-urls/url"`.
     ///
     /// Each serialiser writes only the keys of its own format, so values read from one format are
     /// kept on the record but not written to another. It skips keys that are not valid tags in its
@@ -263,8 +282,38 @@ impl RecordBuilder {
         self
     }
 
+    /// Append one keyword.
+    #[must_use]
+    pub fn keyword(mut self, keyword: impl Into<String>) -> Self {
+        self.record.keywords.push(keyword.into());
+        self
+    }
+
+    /// Append several keywords, in order.
+    #[must_use]
+    pub fn keywords(mut self, keywords: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.record
+            .keywords
+            .extend(keywords.into_iter().map(Into::into));
+        self
+    }
+
+    /// Append one link.
+    #[must_use]
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.record.urls.push(url.into());
+        self
+    }
+
+    /// Append several links, in order.
+    #[must_use]
+    pub fn urls(mut self, urls: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.record.urls.extend(urls.into_iter().map(Into::into));
+        self
+    }
+
     /// Append one value to `key` in `extras`. Keys follow the scheme described on
-    /// [`Record::extras`], e.g. `"ris:KW"`.
+    /// [`Record::extras`], e.g. `"ris:N1"`.
     #[must_use]
     pub fn extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.record

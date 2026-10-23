@@ -66,6 +66,30 @@ pub fn arb_raw_value() -> impl Strategy<Value = String> {
     ]
 }
 
+/// One word of a keyword: letters, digits and punctuation that every format keeps as written, with
+/// at most one hyphen inside (`BibTeX` turns `--` into a dash).
+const KEYWORD_WORD: &str = "[A-Za-z0-9&/*().:'+_]{1,8}(-[A-Za-z0-9&/*().:'+_]{1,8})?";
+
+/// A keyword of one to four words, separated by a single space, or by `, ` or `; ` as in subject
+/// headings such as `Carcinoma, Squamous Cell`. It never starts or ends with whitespace, and never
+/// holds a run of spaces, which `BibTeX` collapses.
+pub fn arb_keyword() -> impl Strategy<Value = String> {
+    proptest::string::string_regex(&format!("{KEYWORD_WORD}((, |; | ){KEYWORD_WORD}){{0,3}}"))
+        .unwrap()
+}
+
+/// A link: a scheme, a host of two to four labels, up to three path segments and an optional query
+/// with `&` and `%`, as real links have. It holds no whitespace, braces or `--`, which `BibTeX`
+/// would change.
+pub fn arb_url() -> impl Strategy<Value = String> {
+    "https?://[a-z0-9]{1,10}(\\.[a-z0-9]{1,10}){1,3}(/[A-Za-z0-9._~%]{1,10}(-[A-Za-z0-9._~%]{1,10})?){0,3}(\\?[a-z]{1,5}=[A-Za-z0-9%]{1,8}(&[a-z]{1,5}=[A-Za-z0-9%]{1,8})?)?"
+}
+
+/// Blank values for a list field: empty, or ASCII and Unicode whitespace only.
+pub fn arb_blank() -> impl Strategy<Value = String> {
+    "[ \t\u{a0}\u{3000}]{0,4}"
+}
+
 /// The first value of `record`'s extra `key`, if any.
 pub fn first_extra<'a>(record: &'a Record, key: &str) -> Option<&'a str> {
     record.extras.get(key)?.first().map(String::as_str)

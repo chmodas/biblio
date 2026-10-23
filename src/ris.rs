@@ -12,8 +12,9 @@ use winnow::Parser;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
-    own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
+    append_to_last, append_to_opt, check_empty, first_non_blank, non_blank, non_blank_values,
+    normalize_line_endings, own_extras, parsed, push_extra, report_missing_title,
+    strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -36,6 +37,13 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// (the last one wins), all but the last `SN`, `DB` and `LB`, and journal tags that lose to a
 /// preferred one. So are dates in `PY` or `Y1` that cannot be read. The database from `DB` is kept
 /// in [`Record::database`], and the label from `LB` in [`Record::label`].
+///
+/// # Keywords and links
+///
+/// Each `KW` adds one keyword to [`Record::keywords`] and each `UR` one link to [`Record::urls`],
+/// in order. Their continuation lines are joined to the value like any other tag's, so an export
+/// that lists several keywords one per line under a single `KW` gives one keyword. Values are
+/// trimmed, and blank ones are dropped.
 ///
 /// # Errors
 ///
@@ -194,6 +202,14 @@ pub fn serialize(records: &[Record]) -> String {
             write_tag(&mut buf, "LB", label);
         }
 
+        for keyword in non_blank_values(&record.keywords) {
+            write_tag(&mut buf, "KW", keyword);
+        }
+
+        for url in non_blank_values(&record.urls) {
+            write_tag(&mut buf, "UR", url);
+        }
+
         // Extras of this format, sorted by tag for deterministic output.
         for (tag, values) in own_extras(&record.extras, "ris") {
             if is_tag_shape(tag) && !is_read_tag(tag) {
@@ -292,6 +308,8 @@ fn is_read_tag(tag: &str) -> bool {
                 | "SN"
                 | "DB"
                 | "LB"
+                | "KW"
+                | "UR"
         )
 }
 
@@ -329,6 +347,8 @@ struct PendingRecord {
     isbn: Option<String>,
     database: Option<String>,
     label: Option<String>,
+    keywords: Vec<String>,
+    urls: Vec<String>,
     /// Values of tags that are not read into a field, keyed `"ris:{tag}"`.
     extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
@@ -353,6 +373,8 @@ impl PendingRecord {
                 "SN" => self.isbn = Some(value.to_owned()),
                 "DB" => self.database = Some(value.to_owned()),
                 "LB" => self.label = Some(value.to_owned()),
+                "KW" => self.keywords.push(value.to_owned()),
+                "UR" => self.urls.push(value.to_owned()),
                 // Keep this list in step with `is_read_tag`.
                 _ => push_extra(&mut self.extras, format!("ris:{tag}"), value),
             }
@@ -377,6 +399,8 @@ impl PendingRecord {
             "DB" => append_to_opt(&mut self.database, text),
             "LB" => append_to_opt(&mut self.label, text),
             "AU" | "A1" => append_to_last(&mut self.authors, text),
+            "KW" => append_to_last(&mut self.keywords, text),
+            "UR" => append_to_last(&mut self.urls, text),
             _ => {
                 if let Some(values) = self.extras.get_mut(&format!("ris:{tag}")) {
                     append_to_last(values, text);
@@ -414,6 +438,8 @@ impl PendingRecord {
             isbn: self.isbn,
             database: self.database,
             label: self.label,
+            keywords: non_blank(self.keywords),
+            urls: non_blank(self.urls),
             extras: self.extras,
         }
     }

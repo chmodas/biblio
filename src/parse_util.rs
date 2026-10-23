@@ -88,6 +88,26 @@ pub(crate) fn parsed(records: Vec<Record>, mut diagnostics: Vec<Diagnostic>) -> 
     }
 }
 
+/// Trim every value of a list field and drop the ones left empty, keeping the rest in order.
+/// `str::trim` removes Unicode whitespace too, so a value of only such whitespace is dropped.
+pub(crate) fn non_blank(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
+        .collect()
+}
+
+/// The values of a list field that are not blank, in order: the ones a serialiser writes.
+pub(crate) fn non_blank_values(values: &[String]) -> impl Iterator<Item = &str> {
+    values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// Append `value` to the `extras` list under `key`.
 pub(crate) fn push_extra(extras: &mut HashMap<String, Vec<String>>, key: String, value: &str) {
     extras.entry(key).or_default().push(value.to_owned());

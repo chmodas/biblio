@@ -10,7 +10,10 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::nbib::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_author, arb_date, arb_pages, arb_raw_value, arb_text, arb_volume, first_extra};
+use common::{
+    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_raw_value, arb_text, arb_url,
+    arb_volume, first_extra,
+};
 
 // -- Core parsing --
 
@@ -157,15 +160,15 @@ fn windows_line_endings() {
 fn unknown_tags_kept_in_extras() {
     let input = "\
 TI  - A test title
-OT  - keyword one
-OT  - keyword two
-MH  - mesh heading
+GR  - grant one
+GR  - grant two
+AD  - an address
 ";
     let records = parse(input).unwrap().records;
     assert_eq!(records[0].title.as_deref(), Some("A test title"));
     let extras = &records[0].extras;
-    assert_eq!(extras["nbib:OT"], vec!["keyword one", "keyword two"]);
-    assert_eq!(extras["nbib:MH"], vec!["mesh heading"]);
+    assert_eq!(extras["nbib:GR"], vec!["grant one", "grant two"]);
+    assert_eq!(extras["nbib:AD"], vec!["an address"]);
     assert_eq!(extras.len(), 2);
 }
 
@@ -494,6 +497,58 @@ TI  - A test title
     assert_eq!(first_extra(&records[0], "nbib:PMC"), Some("PMC9876543"));
 }
 
+// -- Keywords --
+
+/// Subject headings (`MH`) and other terms (`OT`) are both keywords, in the order they appear, and
+/// neither is kept in extras.
+#[test]
+fn mh_and_ot_keywords_in_source_order() {
+    let input = "\
+TI  - t
+MH  - Aged
+OT  - biomarker
+MH  - *Alzheimer Disease/diagnosis
+";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(
+        record.keywords,
+        vec!["Aged", "biomarker", "*Alzheimer Disease/diagnosis"]
+    );
+    assert!(!record.extras.contains_key("nbib:MH"));
+    assert!(!record.extras.contains_key("nbib:OT"));
+}
+
+/// A subject heading wrapped onto the next line is joined to it.
+#[test]
+fn wrapped_mh_joined() {
+    let input = "TI  - t\nMH  - Antineoplastic Agents/adverse\n      effects/therapeutic use\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(
+        record.keywords,
+        vec!["Antineoplastic Agents/adverse effects/therapeutic use"]
+    );
+}
+
+/// Every keyword is written as `OT`, so a subject heading comes back as one.
+#[test]
+fn mh_written_back_as_ot() {
+    let record = parse("TI  - t\nMH  - Aged\n").unwrap().records.remove(0);
+    let output = serialize(std::slice::from_ref(&record));
+    assert_eq!(output, "TI  - t\nOT  - Aged\n\n");
+    assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// The owner of the other terms, `OTO`, stays in extras.
+#[test]
+fn oto_kept_in_extras() {
+    let record = parse("TI  - t\nOTO - NOTNLM\nOT  - AI\n")
+        .unwrap()
+        .records
+        .remove(0);
+    assert_eq!(record.keywords, vec!["AI"]);
+    assert_eq!(first_extra(&record, "nbib:OTO"), Some("NOTNLM"));
+}
+
 // -- Error cases --
 
 #[test]
@@ -604,8 +659,9 @@ fn format_nbib_date(date: PublicationDate) -> String {
 
 /// The tags the `NBIB` parser reads into fields. A copy of the parser's list, so that the tests pin
 /// it.
-const NBIB_READ_TAGS: [&str; 14] = [
-    "TI", "BTI", "CTI", "FAU", "AU", "DP", "JT", "LID", "AID", "PG", "VI", "IP", "AB", "IS",
+const NBIB_READ_TAGS: [&str; 16] = [
+    "TI", "BTI", "CTI", "FAU", "AU", "DP", "JT", "LID", "AID", "PG", "VI", "IP", "AB", "IS", "OT",
+    "MH",
 ];
 
 /// Extras as `NBIB` parsing produces them: up to four tags the parser does not read (such as
@@ -644,6 +700,7 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
         proptest::option::of(arb_text(300)),
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
+            vec(arb_keyword(), 0..4),
             arb_nbib_extras(),
         ),
     )
@@ -658,7 +715,7 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, extras),
+                (isbn, keywords, extras),
             )| {
                 {
                     let mut record = Record::default();
@@ -672,6 +729,7 @@ fn arb_nbib_record() -> impl Strategy<Value = Record> {
                     record.number = number;
                     record.abstract_text = abstract_text;
                     record.isbn = isbn;
+                    record.keywords = keywords;
                     record.extras = extras;
                     record
                 }
@@ -746,7 +804,8 @@ fn adversarial_parse_no_panic(
 /// trimmed continuation text.
 #[proptest]
 fn blank_field_continued_is_continuation_text(
-    #[strategy(select(&["TI", "BTI", "CTI", "AB", "JT", "FAU", "AU"]))] tag: &'static str,
+    #[strategy(select(&["TI", "BTI", "CTI", "AB", "JT", "FAU", "AU", "OT", "MH"]))]
+    tag: &'static str,
     #[strategy("[^\\s\\p{C}]\\PC{0,59}")] text: String,
 ) {
     // The leading title makes the record valid for every tag, and a blank `TI` replaces it. A book
@@ -759,6 +818,7 @@ fn blank_field_continued_is_continuation_text(
         "TI" | "BTI" => record.title,
         "AB" => record.abstract_text,
         "JT" | "CTI" => record.journal,
+        "OT" | "MH" => record.keywords.last().cloned(),
         _ => record.authors.last().cloned(),
     };
     prop_assert_eq!(field.as_deref(), Some(text.trim()));
@@ -994,6 +1054,53 @@ fn foreign_extras_not_written(
             .insert(key.to_owned(), vec![value.clone()]);
     }
     prop_assert_eq!(serialize(&[with_foreign]), serialize(&[record]));
+}
+
+/// `OT` and `MH` lines with raw values, in any mix, give their trimmed non-blank values in order,
+/// and the record comes back unchanged when written and read again.
+#[proptest]
+fn keywords_match_reference(
+    #[strategy(vec((select(&["OT", "MH"]), arb_raw_value()), 0..8))] lines: Vec<(
+        &'static str,
+        String,
+    )>,
+) {
+    let mut input = String::from("TI  - A title\n");
+    for (tag, value) in &lines {
+        writeln!(input, "{tag:<4}- {value}").unwrap();
+    }
+    let first = parse(&input).unwrap().records;
+
+    let reference: Vec<&str> = lines
+        .iter()
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    prop_assert_eq!(&first[0].keywords, &reference);
+    prop_assert_eq!(parse(&serialize(&first)).unwrap().records, first);
+}
+
+/// Blank keywords are not written, wherever they are in the list.
+#[proptest]
+fn blank_keywords_not_written(
+    #[strategy(arb_nbib_record())] record: Record,
+    #[strategy(arb_blank())] blank: String,
+) {
+    let mut with_blanks = record.clone();
+    with_blanks.keywords.insert(0, blank.clone());
+    with_blanks.keywords.push(blank);
+    prop_assert_eq!(serialize(&[with_blanks]), serialize(&[record]));
+}
+
+/// `NBIB` has no tag for links, so they are kept on the record but never written.
+#[proptest]
+fn urls_not_written(
+    #[strategy(arb_nbib_record())] record: Record,
+    #[strategy(vec(arb_url(), 1..3))] urls: Vec<String>,
+) {
+    let mut with_urls = record.clone();
+    with_urls.urls = urls;
+    prop_assert_eq!(serialize(&[with_urls]), serialize(&[record]));
 }
 
 /// Records read from source text with arbitrary unread tags and values come back unchanged when

@@ -13,8 +13,9 @@ use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
 use crate::parse_util::{
-    append_to_last, append_to_opt, check_empty, first_non_blank, normalize_line_endings,
-    own_extras, parsed, push_extra, report_missing_title, strip_byte_order_mark,
+    append_to_last, append_to_opt, check_empty, first_non_blank, non_blank, non_blank_values,
+    normalize_line_endings, own_extras, parsed, push_extra, report_missing_title,
+    strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -31,13 +32,19 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// # Extras
 ///
 /// Every tag without a field is kept in [`Record::extras`] as `"nbib:{tag}"` (e.g. `"nbib:PMID"`,
-/// `"nbib:OT"`), one value per occurrence, with its continuation lines joined. Tags that are read
+/// `"nbib:GR"`), one value per occurrence, with its continuation lines joined. Tags that are read
 /// but lose to another are dropped: `AU` when `FAU` is present, `BTI` when `TI` is present, `CTI`
 /// when `JT` is present, `LID` and `AID` values that are not the DOI, all but the last `IS`, and
 /// dates in `DP` that cannot be read.
 ///
-/// `NBIB` has no tag for the source database or a user's label, so [`Record::database`] and
-/// [`Record::label`] are never set.
+/// `NBIB` has no tag for the source database, a user's label or links, so [`Record::database`],
+/// [`Record::label`] and [`Record::urls`] are never set.
+///
+/// # Keywords
+///
+/// Each `OT` (other term) and each subject heading in `MH` adds one keyword to
+/// [`Record::keywords`], in the order they appear. Values are trimmed, and blank ones are dropped.
+/// The owner of the other terms, `OTO`, stays in extras.
 ///
 /// # Errors
 ///
@@ -112,8 +119,10 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
 /// suffix. `nbib:` extras are written as tags before the fields, `PMID` first and the rest sorted
 /// by tag; keys that are not 2–4 character tags, and tags the parser reads into fields, are
-/// skipped. Extras of other formats are not written, nor are [`Record::database`] and
-/// [`Record::label`]. Records are separated by blank lines.
+/// skipped. Keywords are written as `OT`, so a subject heading read from `MH` is written back as
+/// `OT`; blank keywords are skipped. Extras of other formats are not written, nor are
+/// [`Record::database`], [`Record::label`] and [`Record::urls`]. Records are separated by blank
+/// lines.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -172,6 +181,10 @@ pub fn serialize(records: &[Record]) -> String {
 
         if let Some(isbn) = &record.isbn {
             write_field(&mut buf, "IS", isbn);
+        }
+
+        for keyword in non_blank_values(&record.keywords) {
+            write_field(&mut buf, "OT", keyword);
         }
 
         buf.push('\n');
@@ -292,6 +305,8 @@ fn is_read_tag(tag: &str) -> bool {
             | "IP"
             | "AB"
             | "IS"
+            | "OT"
+            | "MH"
     )
 }
 
@@ -324,6 +339,8 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
+    /// Keywords from `OT` and `MH`, in source order.
+    keywords: Vec<String>,
     /// Values of tags that are not read into a field, keyed `"nbib:{tag}"`.
     extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
@@ -345,6 +362,7 @@ impl PendingRecord {
             "IP" => self.number = Some(value.to_owned()),
             "AB" => self.abstract_text = Some(value.to_owned()),
             "IS" => self.isbn = Some(value.to_owned()),
+            "OT" | "MH" => self.keywords.push(value.to_owned()),
             // Keep this list in step with `is_read_tag`.
             _ => push_extra(&mut self.extras, format!("nbib:{tag}"), value),
         }
@@ -366,6 +384,8 @@ impl PendingRecord {
             "FAU" => append_to_last(&mut self.fau_authors, text),
             "AU" => append_to_last(&mut self.au_authors, text),
             "LID" | "AID" => append_to_last(&mut self.doi_candidates, text),
+            // Both tags feed one list, so the last keyword is the one being continued.
+            "OT" | "MH" => append_to_last(&mut self.keywords, text),
             _ => {
                 if let Some(values) = self.extras.get_mut(&format!("nbib:{tag}")) {
                     append_to_last(values, text);
@@ -401,6 +421,8 @@ impl PendingRecord {
             isbn: self.isbn,
             database: None,
             label: None,
+            keywords: non_blank(self.keywords),
+            urls: Vec::new(),
             extras: self.extras,
         }
     }
