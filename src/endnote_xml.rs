@@ -35,10 +35,11 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// The text of every element without a field is kept in [`Record::extras`] under its element path
 /// below `<record>`, e.g. `"endnote:keywords/keyword"`, one value per element. Fields are matched
 /// by the end of their path: any path ending in `pages` fills the pages, for instance, while
-/// `titles/secondary-title` and `dates/pub-dates/date` become extras. Only elements without child
-/// elements hold values, and empty ones are skipped. Attributes, such as the name in
-/// `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year` that cannot be read are
-/// dropped.
+/// `titles/secondary-title` and `dates/pub-dates/date` become extras. A path ending in
+/// `remote-database-name` fills [`Record::database`], while `remote-database-provider` stays an
+/// extra. Only elements without child elements hold values, and empty ones are skipped. Attributes,
+/// such as the name in `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year`
+/// that cannot be read are dropped.
 ///
 /// A leading byte-order mark is ignored.
 ///
@@ -330,6 +331,10 @@ fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
         write_simple_element(writer, "isbn", isbn);
     }
 
+    if let Some(database) = &record.database {
+        write_simple_element(writer, "remote-database-name", database);
+    }
+
     // Extras of this format, one block of nested elements per key, sorted by path.
     for (path, values) in own_extras(&record.extras, "endnote") {
         let segments: Vec<&str> = path.split('/').collect();
@@ -446,6 +451,7 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
+    database: Option<String>,
     /// Values of elements that are not read into a field, keyed `"endnote:{path}"`.
     extras: HashMap<String, Vec<String>>,
 }
@@ -462,6 +468,7 @@ enum ReadField {
     Number,
     Abstract,
     Isbn,
+    Database,
 }
 
 /// The field an element path below `<record>` is read into, if any. A rule written `[.., name]`
@@ -478,6 +485,7 @@ fn read_field(path: &[&str]) -> Option<ReadField> {
         [.., "number"] => ReadField::Number,
         [.., "abstract"] => ReadField::Abstract,
         [.., "isbn"] => ReadField::Isbn,
+        [.., "remote-database-name"] => ReadField::Database,
         _ => return None,
     })
 }
@@ -502,6 +510,7 @@ impl PendingRecord {
             Some(ReadField::Number) => self.number = value,
             Some(ReadField::Abstract) => self.abstract_text = value,
             Some(ReadField::Isbn) => self.isbn = value,
+            Some(ReadField::Database) => self.database = value,
             None => push_extra(
                 &mut self.extras,
                 format!("endnote:{}", names.join("/")),
@@ -534,6 +543,7 @@ impl PendingRecord {
             number: self.number,
             abstract_text: self.abstract_text,
             isbn: self.isbn,
+            database: self.database,
             extras: self.extras,
         }
     }

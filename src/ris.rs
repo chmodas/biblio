@@ -33,8 +33,9 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Every tag without a field is kept in [`Record::extras`] as `"ris:{tag}"`, one value per
 /// occurrence, with its continuation lines joined; the record type from `TY` is kept as `"ris:TY"`.
 /// Tags that are read but lose to another are dropped: `T1` when `TI` is present, `Y1` and `PY`
-/// (the last one wins), all but the last `SN`, and journal tags that lose to a preferred one. So
-/// are dates in `PY` or `Y1` that cannot be read.
+/// (the last one wins), all but the last `SN`, all but the last `DB`, and journal tags that lose to
+/// a preferred one. So are dates in `PY` or `Y1` that cannot be read. The database from `DB` is
+/// kept in [`Record::database`].
 ///
 /// # Errors
 ///
@@ -185,6 +186,10 @@ pub fn serialize(records: &[Record]) -> String {
             write_tag(&mut buf, "SN", isbn);
         }
 
+        if let Some(database) = &record.database {
+            write_tag(&mut buf, "DB", database);
+        }
+
         // Extras of this format, sorted by tag for deterministic output.
         for (tag, values) in own_extras(&record.extras, "ris") {
             if is_tag_shape(tag) && !is_read_tag(tag) {
@@ -281,6 +286,7 @@ fn is_read_tag(tag: &str) -> bool {
                 | "AB"
                 | "N2"
                 | "SN"
+                | "DB"
         )
 }
 
@@ -316,6 +322,7 @@ struct PendingRecord {
     number: Option<String>,
     abstract_text: Option<String>,
     isbn: Option<String>,
+    database: Option<String>,
     /// Values of tags that are not read into a field, keyed `"ris:{tag}"`.
     extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
@@ -338,6 +345,7 @@ impl PendingRecord {
                 "IS" => self.number = Some(value.to_owned()),
                 "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
                 "SN" => self.isbn = Some(value.to_owned()),
+                "DB" => self.database = Some(value.to_owned()),
                 // Keep this list in step with `is_read_tag`.
                 _ => push_extra(&mut self.extras, format!("ris:{tag}"), value),
             }
@@ -359,6 +367,7 @@ impl PendingRecord {
             "TI" => append_to_opt(&mut self.ti_title, text),
             "T1" => append_to_opt(&mut self.t1_title, text),
             "AB" | "N2" => append_to_opt(&mut self.abstract_text, text),
+            "DB" => append_to_opt(&mut self.database, text),
             "AU" | "A1" => append_to_last(&mut self.authors, text),
             _ => {
                 if let Some(values) = self.extras.get_mut(&format!("ris:{tag}")) {
@@ -395,6 +404,7 @@ impl PendingRecord {
             number: self.number,
             abstract_text: self.abstract_text,
             isbn: self.isbn,
+            database: self.database,
             extras: self.extras,
         }
     }

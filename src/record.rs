@@ -115,6 +115,15 @@ pub struct Record {
     /// format provides.
     pub isbn: Option<String>,
 
+    /// The bibliographic database the record was exported from, as the source names it (e.g.
+    /// `"Scopus"`, `"MEDLINE"`).
+    ///
+    /// `RIS` reads it from `DB` and `EndNote XML` from `remote-database-name`, and both write it
+    /// back. `NBIB` and `BibTeX` never set it and do not write it, so converting a record to them
+    /// drops the database from the output but not from the record. `RIS` keeps a blank `DB` as
+    /// `Some("")`; `EndNote XML` ignores an empty element.
+    pub database: Option<String>,
+
     /// Every field of the source that has no slot above, keyed by format and tag, with its values
     /// in source order.
     ///
@@ -228,6 +237,13 @@ impl RecordBuilder {
     #[must_use]
     pub fn isbn(mut self, isbn: impl Into<String>) -> Self {
         self.record.isbn = Some(isbn.into());
+        self
+    }
+
+    /// Set the database the record was exported from.
+    #[must_use]
+    pub fn database(mut self, database: impl Into<String>) -> Self {
+        self.record.database = Some(database.into());
         self
     }
 

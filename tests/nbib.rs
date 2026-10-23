@@ -959,6 +959,17 @@ fn read_tags_never_written_from_extras(
     prop_assert_eq!(serialize(&[with_read_tag]), serialize(&[record]));
 }
 
+/// `NBIB` has no tag for the source database, so it is kept on the record but never written.
+#[proptest]
+fn database_not_written(
+    #[strategy(arb_nbib_record())] record: Record,
+    #[strategy(arb_text(30))] database: String,
+) {
+    let mut with_database = record.clone();
+    with_database.database = Some(database);
+    prop_assert_eq!(serialize(&[with_database]), serialize(&[record]));
+}
+
 /// Extras of other formats are kept on the record but never written as `NBIB` tags.
 #[proptest]
 fn foreign_extras_not_written(

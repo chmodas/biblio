@@ -577,6 +577,18 @@ fn journal_fallback() {
     assert_eq!(records[0].journal.as_deref(), Some("Science"));
 }
 
+// -- Source database --
+
+/// `BibTeX` has no field for the source database: `source` and `database` stay in extras.
+#[test]
+fn database_never_set() {
+    let input = "@article{k,\n  title = {t},\n  source = {Scopus},\n  database = {Scopus},\n}\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.database, None);
+    assert_eq!(first_extra(&record, "bibtex:source"), Some("Scopus"));
+    assert_eq!(first_extra(&record, "bibtex:database"), Some("Scopus"));
+}
+
 // -- Identifiers --
 
 /// Parse a single entry whose fields, after the title, are `field_lines`, and return its
@@ -1622,6 +1634,17 @@ fn read_fields_never_written_from_extras(
         .extras
         .insert(format!("bibtex:{name}"), vec!["leaked value".to_owned()]);
     prop_assert_eq!(serialize(&[with_read_field]), serialize(&[record]));
+}
+
+/// The source database is kept on the record but never written as a `BibTeX` field.
+#[proptest]
+fn database_not_written(
+    #[strategy(arb_bibtex_record())] record: Record,
+    #[strategy("[A-Za-z0-9 ]{1,30}")] database: String,
+) {
+    let mut with_database = record.clone();
+    with_database.database = Some(database);
+    prop_assert_eq!(serialize(&[with_database]), serialize(&[record]));
 }
 
 /// Extras of other formats are kept on the record but never written as `BibTeX` fields.
