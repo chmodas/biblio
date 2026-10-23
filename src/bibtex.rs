@@ -115,7 +115,9 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// parser's reading of a signed two-digit year there, so `-44` gives it 1956.
 ///
 /// `BibTeX` and `BibLaTeX` have no field for the source database, so [`Record::database`] is never
-/// set; exporter fields such as `source` (Scopus) stay in extras.
+/// set; exporter fields such as `source` (Scopus) stay in extras. `BibLaTeX`'s `label` field is a
+/// substitute citation label, not a user's label, so [`Record::label`] is never set and `label`
+/// stays in extras.
 ///
 /// # Identifiers
 ///
@@ -301,7 +303,7 @@ fn lines_of(input: &str, offsets: &[usize]) -> Vec<usize> {
 /// names that are not valid field names, and fields the parser reads, are skipped. A `crossref`
 /// that would close a cycle among the records written (to the entry itself, directly or through an
 /// `ids` alias, or through other entries) is skipped too, because such an entry cannot be resolved.
-/// Extras of other formats are not written, nor is [`Record::database`].
+/// Extras of other formats are not written, nor are [`Record::database`] and [`Record::label`].
 ///
 /// Values are escaped so that braces, backslashes and `$` read back unchanged: `\`, `{` and `}`
 /// everywhere, and `$` except in verbatim fields such as `url` and `doi`. The parser still turns
@@ -607,6 +609,7 @@ fn record_from_entry(
         abstract_text,
         isbn,
         database: None,
+        label: None,
         extras,
     }
 }

@@ -689,6 +689,73 @@ fn serialize_writes_db() {
     );
 }
 
+// -- Label --
+
+/// `LB` is read as the label and not kept in extras.
+#[test]
+fn lb_read_as_label() {
+    let record = parse("TY  - JOUR\nTI  - t\nLB  - OLD\nER  -\n")
+        .unwrap()
+        .records
+        .remove(0);
+    assert_eq!(record.label.as_deref(), Some("OLD"));
+    assert!(!record.extras.contains_key("ris:LB"));
+}
+
+/// A label wrapped onto the next line is joined to it.
+#[test]
+fn lb_continuation_joined() {
+    let input = "\
+TY  - JOUR
+TI  - t
+LB  - Included after
+  full-text screening
+ER  -
+";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(
+        record.label.as_deref(),
+        Some("Included after full-text screening")
+    );
+}
+
+/// A repeated `LB` keeps its last value.
+#[test]
+fn repeated_lb_keeps_last() {
+    let input = "TY  - JOUR\nTI  - t\nLB  - OLD\nLB  - NEW\nER  -\n";
+    let record = parse(input).unwrap().records.remove(0);
+    assert_eq!(record.label.as_deref(), Some("NEW"));
+}
+
+/// A blank `LB` is kept as an empty label, and survives a round trip.
+#[test]
+fn blank_lb_kept_empty() {
+    let record = parse("TY  - JOUR\nTI  - t\nLB  -\nER  -\n")
+        .unwrap()
+        .records
+        .remove(0);
+    assert_eq!(record.label.as_deref(), Some(""));
+    let reparsed = parse(&serialize(std::slice::from_ref(&record)))
+        .unwrap()
+        .records;
+    assert_eq!(reparsed, vec![record]);
+}
+
+/// The label is written as `LB`, after `DB`.
+#[test]
+fn serialize_writes_lb() {
+    let record = Record::builder()
+        .title("T")
+        .isbn("1234-5678")
+        .database("Web of Science")
+        .label("OLD")
+        .build();
+    assert_eq!(
+        serialize(&[record]),
+        "TY  - JOUR\nTI  - T\nSN  - 1234-5678\nDB  - Web of Science\nLB  - OLD\nER  -\n"
+    );
+}
+
 // -- Error cases --
 
 #[test]
@@ -875,9 +942,9 @@ fn format_ris_date(date: PublicationDate) -> String {
 
 /// The tags the `RIS` parser reads into fields or record structure. A copy of the parser's list, so
 /// that the tests pin it.
-const RIS_READ_TAGS: [&str; 23] = [
+const RIS_READ_TAGS: [&str; 24] = [
     "TY", "ER", "TI", "T1", "AU", "A1", "PY", "Y1", "DO", "SP", "EP", "VL", "IS", "AB", "N2", "SN",
-    "DB", "JF", "T2", "JO", "JA", "J2", "J1",
+    "DB", "LB", "JF", "T2", "JO", "JA", "J2", "J1",
 ];
 
 /// Extras as `RIS` parsing produces them: a record type, and up to four tags the parser does not
@@ -914,6 +981,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"),
             proptest::option::of(arb_text(60)),
+            proptest::option::of(arb_text(60)),
             arb_ris_extras(),
         ),
     )
@@ -928,7 +996,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, database, extras),
+                (isbn, database, label, extras),
             )| {
                 {
                     let mut record = Record::default();
@@ -943,6 +1011,7 @@ fn arb_ris_record() -> impl Strategy<Value = Record> {
                     record.abstract_text = abstract_text;
                     record.isbn = isbn;
                     record.database = database;
+                    record.label = label;
                     record.extras = extras;
                     record
                 }
@@ -1073,7 +1142,7 @@ const CONTINUATION_TEXT: &str = "[^\\s\\p{C}-][^\\p{C}-]{0,59}";
 #[proptest]
 fn blank_field_continued_is_continuation_text(
     #[strategy(select(&[
-        "TI", "T1", "AB", "N2", "AU", "A1", "DB", "JF", "T2", "JO", "JA", "J2", "J1",
+        "TI", "T1", "AB", "N2", "AU", "A1", "DB", "LB", "JF", "T2", "JO", "JA", "J2", "J1",
     ]))]
     tag: &'static str,
     #[strategy(CONTINUATION_TEXT)] text: String,
@@ -1092,6 +1161,7 @@ fn blank_field_continued_is_continuation_text(
         "AB" | "N2" => record.abstract_text,
         "AU" | "A1" => record.authors.last().cloned(),
         "DB" => record.database,
+        "LB" => record.label,
         _ => record.journal,
     };
     prop_assert_eq!(field.as_deref(), Some(text.trim()));

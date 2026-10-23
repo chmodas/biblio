@@ -61,10 +61,10 @@ fn single_record() {
         Some("This is the abstract text.")
     );
     assert_eq!(r.isbn.as_deref(), Some("1234-5678"));
-    assert_eq!(first_extra(r, "endnote:label"), Some("ref001"));
+    assert_eq!(r.label.as_deref(), Some("ref001"));
     assert_eq!(first_extra(r, "endnote:rec-number"), Some("42"));
     // The whitespace inside containers such as <authors> is not a value.
-    assert_eq!(r.extras.len(), 2, "{:?}", r.extras);
+    assert_eq!(r.extras.len(), 1, "{:?}", r.extras);
 }
 
 #[test]
@@ -290,35 +290,6 @@ fn unread_elements_kept_by_path() {
     assert_eq!(extras.len(), 4);
 }
 
-#[test]
-fn extras_label_and_rec_number() {
-    let input = r"<xml><records>
-<record>
-  <rec-number>99</rec-number>
-  <titles><title>Test</title></titles>
-  <label>myref</label>
-</record>
-</records></xml>";
-
-    let records = parse(input).unwrap().records;
-    assert_eq!(first_extra(&records[0], "endnote:label"), Some("myref"));
-    assert_eq!(first_extra(&records[0], "endnote:rec-number"), Some("99"));
-}
-
-#[test]
-fn extras_label_only() {
-    let input = r"<xml><records>
-<record>
-  <titles><title>Test</title></titles>
-  <label>onlylabel</label>
-</record>
-</records></xml>";
-
-    let records = parse(input).unwrap().records;
-    assert_eq!(first_extra(&records[0], "endnote:label"), Some("onlylabel"));
-    assert_eq!(first_extra(&records[0], "endnote:rec-number"), None);
-}
-
 // -- Source database --
 
 /// Wrap the elements `body` in a single `<record>` with a title, and parse it.
@@ -398,6 +369,67 @@ fn database_carried_from_endnote_to_ris() {
         .unwrap()
         .records;
     assert_eq!(converted[0].database.as_deref(), Some("CINAHL"));
+}
+
+// -- Label --
+
+/// `label` is read as the label and not kept in extras; `rec-number` stays an extra.
+#[test]
+fn label_read_as_label() {
+    let record = parse_record("<rec-number>99</rec-number><label>myref</label>");
+    assert_eq!(record.label.as_deref(), Some("myref"));
+    assert!(!record.extras.contains_key("endnote:label"));
+    assert_eq!(first_extra(&record, "endnote:rec-number"), Some("99"));
+}
+
+/// The style tags `EndNote` wraps a label in are removed.
+#[test]
+fn label_wrapped_in_style_tags() {
+    let record = parse_record(
+        r#"<label><style face="normal" font="default" size="100%">OLD</style></label>"#,
+    );
+    assert_eq!(record.label.as_deref(), Some("OLD"));
+}
+
+/// A repeated `label` keeps its last value.
+#[test]
+fn repeated_label_keeps_last() {
+    let record = parse_record("<label>OLD</label><label>NEW</label>");
+    assert_eq!(record.label.as_deref(), Some("NEW"));
+}
+
+/// The label is written as `<label>` directly under `<record>`, after `<remote-database-name>`.
+#[test]
+fn serialize_writes_label() {
+    let record = Record::builder()
+        .title("T")
+        .database("PubMed")
+        .label("OLD")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains("</remote-database-name><label>OLD</label></record>"));
+}
+
+/// A blank label read from `RIS` is written to `EndNote XML` as an empty element, which reads back
+/// as no label.
+#[test]
+fn blank_label_from_ris_reads_back_as_none() {
+    let from_ris = biblio::ris::parse("TY  - JOUR\nTI  - t\nLB  -\nER  -\n")
+        .unwrap()
+        .records;
+    assert_eq!(from_ris[0].label.as_deref(), Some(""));
+    let reparsed = parse(&serialize(&from_ris)).unwrap().records;
+    assert_eq!(reparsed[0].label, None);
+}
+
+/// The label read from `EndNote XML` is carried through a conversion to `RIS` and back.
+#[test]
+fn label_carried_from_endnote_to_ris() {
+    let records = vec![parse_record("<label>Drummond2017</label>")];
+    let converted = biblio::ris::parse(&biblio::ris::serialize(&records))
+        .unwrap()
+        .records;
+    assert_eq!(converted[0].label.as_deref(), Some("Drummond2017"));
 }
 
 // -- Error cases --
@@ -619,6 +651,7 @@ fn serialize_skips_none_fields() {
     assert!(!output.contains("<volume>"));
     assert!(!output.contains("<pages>"));
     assert!(!output.contains("<isbn>"));
+    assert!(!output.contains("<label>"));
 }
 
 // -- Proptest helpers --
@@ -626,7 +659,7 @@ fn serialize_skips_none_fields() {
 /// The leaf element names that the `EndNote XML` parser reads into fields. Some are read only under
 /// a particular container (`title` under `titles`, for instance), but the generator avoids them
 /// everywhere, which is simpler and only slightly over-cautious.
-const ENDNOTE_READ_LEAVES: [&str; 11] = [
+const ENDNOTE_READ_LEAVES: [&str; 12] = [
     "title",
     "author",
     "year",
@@ -638,6 +671,7 @@ const ENDNOTE_READ_LEAVES: [&str; 11] = [
     "abstract",
     "isbn",
     "remote-database-name",
+    "label",
 ];
 
 /// An element path below `<record>` that the parser does not read: one to three names, none of them
@@ -683,6 +717,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
         (
             proptest::option::of("[0-9]{4}-[0-9]{3}[0-9X]"), // ISSN
             proptest::option::of(arb_xml_text(60)),          // database
+            proptest::option::of(arb_xml_text(60)),          // label
             proptest::collection::hash_map(
                 arb_unread_path(),
                 proptest::collection::vec(arb_xml_text(40), 1..=3),
@@ -701,7 +736,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                 volume,
                 number,
                 abstract_text,
-                (isbn, database, unread),
+                (isbn, database, label, unread),
             )| {
                 let extras: HashMap<String, Vec<String>> = unread
                     .into_iter()
@@ -720,6 +755,7 @@ fn arb_endnote_record() -> impl Strategy<Value = Record> {
                     record.abstract_text = abstract_text;
                     record.isbn = isbn;
                     record.database = database;
+                    record.label = label;
                     record.extras = extras;
                     record
                 }
@@ -855,7 +891,7 @@ fn byte_order_mark_does_not_change_result(
 const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "bibtex:note"];
 
 /// The element paths the parser reads into fields, in the form it reads them.
-const ENDNOTE_READ_PATHS: [&str; 11] = [
+const ENDNOTE_READ_PATHS: [&str; 12] = [
     "titles/title",
     "contributors/authors/author",
     "dates/year",
@@ -867,6 +903,7 @@ const ENDNOTE_READ_PATHS: [&str; 11] = [
     "abstract",
     "isbn",
     "remote-database-name",
+    "label",
 ];
 
 /// An extra whose path the parser reads into a field is never written, so it cannot leak into the

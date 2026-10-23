@@ -118,11 +118,20 @@ pub struct Record {
     /// The bibliographic database the record was exported from, as the source names it (e.g.
     /// `"Scopus"`, `"MEDLINE"`).
     ///
-    /// `RIS` reads it from `DB` and `EndNote XML` from `remote-database-name`, and both write it
-    /// back. `NBIB` and `BibTeX` never set it and do not write it, so converting a record to them
-    /// drops the database from the output but not from the record. `RIS` keeps a blank `DB` as
-    /// `Some("")`; `EndNote XML` ignores an empty element.
+    /// `RIS` reads and writes it as `DB`, and `EndNote XML` as `<remote-database-name>`. `NBIB` and
+    /// `BibTeX` neither read nor write it, so converting a record to them drops the database from
+    /// the output but not from the record. `RIS` keeps a blank `DB` as `Some("")`; `EndNote XML`
+    /// ignores an empty element.
     pub database: Option<String>,
+
+    /// A user's label on the record, as written in the source (e.g. `"OLD"`, `"included"`).
+    ///
+    /// `RIS` reads and writes it as `LB`, and `EndNote XML` as `<label>`. `NBIB` and `BibTeX`
+    /// neither read nor write it, so converting a record to them drops the label from the output
+    /// but not from the record; a `BibTeX` `label` field is a substitute citation label, not a
+    /// user's label, and stays in [`Record::extras`]. `RIS` keeps a blank `LB` as `Some("")`;
+    /// `EndNote XML` ignores an empty element.
+    pub label: Option<String>,
 
     /// Every field of the source that has no slot above, keyed by format and tag, with its values
     /// in source order.
@@ -244,6 +253,13 @@ impl RecordBuilder {
     #[must_use]
     pub fn database(mut self, database: impl Into<String>) -> Self {
         self.record.database = Some(database.into());
+        self
+    }
+
+    /// Set the user's label on the record.
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.record.label = Some(label.into());
         self
     }
 
