@@ -33,9 +33,9 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Every tag without a field is kept in [`Record::extras`] as `"ris:{tag}"`, one value per
 /// occurrence, with its continuation lines joined; the record type from `TY` is kept as `"ris:TY"`.
 /// Tags that are read but lose to another are dropped: `T1` when `TI` is present, `Y1` and `PY`
-/// (the last one wins), all but the last `SN`, all but the last `DB`, and journal tags that lose to
-/// a preferred one. So are dates in `PY` or `Y1` that cannot be read. The database from `DB` is
-/// kept in [`Record::database`].
+/// (the last one wins), all but the last `SN`, `DB` and `LB`, and journal tags that lose to a
+/// preferred one. So are dates in `PY` or `Y1` that cannot be read. The database from `DB` is kept
+/// in [`Record::database`], and the label from `LB` in [`Record::label`].
 ///
 /// # Errors
 ///
@@ -190,6 +190,10 @@ pub fn serialize(records: &[Record]) -> String {
             write_tag(&mut buf, "DB", database);
         }
 
+        if let Some(label) = &record.label {
+            write_tag(&mut buf, "LB", label);
+        }
+
         // Extras of this format, sorted by tag for deterministic output.
         for (tag, values) in own_extras(&record.extras, "ris") {
             if is_tag_shape(tag) && !is_read_tag(tag) {
@@ -287,6 +291,7 @@ fn is_read_tag(tag: &str) -> bool {
                 | "N2"
                 | "SN"
                 | "DB"
+                | "LB"
         )
 }
 
@@ -323,6 +328,7 @@ struct PendingRecord {
     abstract_text: Option<String>,
     isbn: Option<String>,
     database: Option<String>,
+    label: Option<String>,
     /// Values of tags that are not read into a field, keyed `"ris:{tag}"`.
     extras: HashMap<String, Vec<String>>,
     last_tag: Option<String>,
@@ -346,6 +352,7 @@ impl PendingRecord {
                 "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
                 "SN" => self.isbn = Some(value.to_owned()),
                 "DB" => self.database = Some(value.to_owned()),
+                "LB" => self.label = Some(value.to_owned()),
                 // Keep this list in step with `is_read_tag`.
                 _ => push_extra(&mut self.extras, format!("ris:{tag}"), value),
             }
@@ -368,6 +375,7 @@ impl PendingRecord {
             "T1" => append_to_opt(&mut self.t1_title, text),
             "AB" | "N2" => append_to_opt(&mut self.abstract_text, text),
             "DB" => append_to_opt(&mut self.database, text),
+            "LB" => append_to_opt(&mut self.label, text),
             "AU" | "A1" => append_to_last(&mut self.authors, text),
             _ => {
                 if let Some(values) = self.extras.get_mut(&format!("ris:{tag}")) {
@@ -405,6 +413,7 @@ impl PendingRecord {
             abstract_text: self.abstract_text,
             isbn: self.isbn,
             database: self.database,
+            label: self.label,
             extras: self.extras,
         }
     }

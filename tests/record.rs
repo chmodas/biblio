@@ -22,6 +22,7 @@ fn builder_sets_every_field() {
         .abstract_text("An abstract.")
         .isbn("1234-5678")
         .database("Scopus")
+        .label("OLD")
         .extra("nbib:PMID", "123")
         .extra("ris:KW", "cats")
         .extra("ris:KW", "dogs")
@@ -41,6 +42,7 @@ fn builder_sets_every_field() {
     assert_eq!(record.abstract_text.as_deref(), Some("An abstract."));
     assert_eq!(record.isbn.as_deref(), Some("1234-5678"));
     assert_eq!(record.database.as_deref(), Some("Scopus"));
+    assert_eq!(record.label.as_deref(), Some("OLD"));
     assert_eq!(record.extras["nbib:PMID"], vec!["123"]);
     assert_eq!(record.extras["ris:KW"], vec!["cats", "dogs"]);
 }

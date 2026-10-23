@@ -970,6 +970,17 @@ fn database_not_written(
     prop_assert_eq!(serialize(&[with_database]), serialize(&[record]));
 }
 
+/// `NBIB` has no tag for a user's label, so it is kept on the record but never written.
+#[proptest]
+fn label_not_written(
+    #[strategy(arb_nbib_record())] record: Record,
+    #[strategy(arb_text(30))] label: String,
+) {
+    let mut with_label = record.clone();
+    with_label.label = Some(label);
+    prop_assert_eq!(serialize(&[with_label]), serialize(&[record]));
+}
+
 /// Extras of other formats are kept on the record but never written as `NBIB` tags.
 #[proptest]
 fn foreign_extras_not_written(

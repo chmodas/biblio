@@ -589,6 +589,20 @@ fn database_never_set() {
     assert_eq!(first_extra(&record, "bibtex:database"), Some("Scopus"));
 }
 
+// -- Label --
+
+/// `BibLaTeX`'s `label` field is a substitute citation label, not a user's label, so it stays in
+/// extras.
+#[test]
+fn label_never_set() {
+    let record = parse("@article{k,\n  title = {t},\n  label = {Doe24},\n}\n")
+        .unwrap()
+        .records
+        .remove(0);
+    assert_eq!(record.label, None);
+    assert_eq!(first_extra(&record, "bibtex:label"), Some("Doe24"));
+}
+
 // -- Identifiers --
 
 /// Parse a single entry whose fields, after the title, are `field_lines`, and return its
@@ -1645,6 +1659,17 @@ fn database_not_written(
     let mut with_database = record.clone();
     with_database.database = Some(database);
     prop_assert_eq!(serialize(&[with_database]), serialize(&[record]));
+}
+
+/// A user's label is kept on the record but never written as a `BibTeX` field.
+#[proptest]
+fn label_not_written(
+    #[strategy(arb_bibtex_record())] record: Record,
+    #[strategy("[A-Za-z0-9 ]{1,30}")] label: String,
+) {
+    let mut with_label = record.clone();
+    with_label.label = Some(label);
+    prop_assert_eq!(serialize(&[with_label]), serialize(&[record]));
 }
 
 /// Extras of other formats are kept on the record but never written as `BibTeX` fields.

@@ -36,7 +36,8 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// when `JT` is present, `LID` and `AID` values that are not the DOI, all but the last `IS`, and
 /// dates in `DP` that cannot be read.
 ///
-/// `NBIB` has no tag for the source database, so [`Record::database`] is never set.
+/// `NBIB` has no tag for the source database or a user's label, so [`Record::database`] and
+/// [`Record::label`] are never set.
 ///
 /// # Errors
 ///
@@ -111,8 +112,8 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
 /// suffix. `nbib:` extras are written as tags before the fields, `PMID` first and the rest sorted
 /// by tag; keys that are not 2–4 character tags, and tags the parser reads into fields, are
-/// skipped. Extras of other formats are not written, nor is [`Record::database`]. Records are
-/// separated by blank lines.
+/// skipped. Extras of other formats are not written, nor are [`Record::database`] and
+/// [`Record::label`]. Records are separated by blank lines.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -399,6 +400,7 @@ impl PendingRecord {
             abstract_text: self.abstract_text,
             isbn: self.isbn,
             database: None,
+            label: None,
             extras: self.extras,
         }
     }

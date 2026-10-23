@@ -37,9 +37,10 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// by the end of their path: any path ending in `pages` fills the pages, for instance, while
 /// `titles/secondary-title` and `dates/pub-dates/date` become extras. A path ending in
 /// `remote-database-name` fills [`Record::database`], while `remote-database-provider` stays an
-/// extra. Only elements without child elements hold values, and empty ones are skipped. Attributes,
-/// such as the name in `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year`
-/// that cannot be read are dropped.
+/// extra. A path ending in `label` fills [`Record::label`]. Only elements without child elements
+/// hold values, and empty ones are skipped. Attributes, such as the name in
+/// `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year` that cannot be read are
+/// dropped.
 ///
 /// A leading byte-order mark is ignored.
 ///
@@ -335,6 +336,10 @@ fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
         write_simple_element(writer, "remote-database-name", database);
     }
 
+    if let Some(label) = &record.label {
+        write_simple_element(writer, "label", label);
+    }
+
     // Extras of this format, one block of nested elements per key, sorted by path.
     for (path, values) in own_extras(&record.extras, "endnote") {
         let segments: Vec<&str> = path.split('/').collect();
@@ -452,6 +457,7 @@ struct PendingRecord {
     abstract_text: Option<String>,
     isbn: Option<String>,
     database: Option<String>,
+    label: Option<String>,
     /// Values of elements that are not read into a field, keyed `"endnote:{path}"`.
     extras: HashMap<String, Vec<String>>,
 }
@@ -469,6 +475,7 @@ enum ReadField {
     Abstract,
     Isbn,
     Database,
+    Label,
 }
 
 /// The field an element path below `<record>` is read into, if any. A rule written `[.., name]`
@@ -486,6 +493,7 @@ fn read_field(path: &[&str]) -> Option<ReadField> {
         [.., "abstract"] => ReadField::Abstract,
         [.., "isbn"] => ReadField::Isbn,
         [.., "remote-database-name"] => ReadField::Database,
+        [.., "label"] => ReadField::Label,
         _ => return None,
     })
 }
@@ -511,6 +519,7 @@ impl PendingRecord {
             Some(ReadField::Abstract) => self.abstract_text = value,
             Some(ReadField::Isbn) => self.isbn = value,
             Some(ReadField::Database) => self.database = value,
+            Some(ReadField::Label) => self.label = value,
             None => push_extra(
                 &mut self.extras,
                 format!("endnote:{}", names.join("/")),
@@ -544,6 +553,7 @@ impl PendingRecord {
             abstract_text: self.abstract_text,
             isbn: self.isbn,
             database: self.database,
+            label: self.label,
             extras: self.extras,
         }
     }
