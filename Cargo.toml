@@ -23,6 +23,7 @@ pedantic = "warn"
 
 [dependencies]
 biblatex = "0.11"
+encoding_rs = "0.8"
 quick-xml = "0.39"
 winnow = "1"
 
