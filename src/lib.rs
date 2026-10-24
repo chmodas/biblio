@@ -22,7 +22,21 @@
 //! // Fields only `BibTeX` has, such as the citation key, are not written into the `RIS`.
 //! assert!(!ris_output.contains("doe2024"));
 //! ```
+//!
+//! # Reading bytes
+//!
+//! The parsers take text. To read a file that may not be UTF-8, [`decode`] its bytes first; it
+//! never fails, and reports the encoding it used:
+//!
+//! ```
+//! // "Café" in Windows-1252, as an older Windows exporter writes it.
+//! let bytes = b"TY  - JOUR\nTI  - Caf\xe9\nER  - \n";
+//! let decoded = biblio::decode(bytes);
+//! let parsed = biblio::ris::parse(&decoded.text).unwrap();
+//! assert_eq!(parsed.records[0].title.as_deref(), Some("Café"));
+//! ```
 pub mod bibtex;
+mod decode;
 pub mod endnote_xml;
 mod error;
 pub mod nbib;
@@ -31,6 +45,7 @@ mod parsed;
 mod record;
 pub mod ris;
 
+pub use decode::{Decoded, Encoding, decode};
 pub use error::Error;
 pub use parsed::{Diagnostic, Parsed};
 pub use record::{PublicationDate, Record, RecordBuilder};

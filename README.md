@@ -60,6 +60,20 @@ let rec = Record::builder()
 
 The title is optional, because some records have none. Every field without a slot of its own lands in `extras: HashMap<String, Vec<String>>`, keyed by format and tag (`"ris:N1"`, `"nbib:PMID"`, `"bibtex:note"`, `"endnote:urls/pdf-urls/url"`, …) with its values in order, so fields without a slot are no longer dropped. Each serialiser writes back only the extras of its own format: converting BibTeX to RIS keeps the BibTeX-only fields on the record but does not write them into the RIS.
 
+## Reading files in other encodings
+
+The parsers take text, but exports are not always UTF-8. `biblio::decode` turns the bytes of a file into text and never fails: it follows a byte-order mark (UTF-8 or UTF-16), keeps valid UTF-8 as it is, then uses the encoding named in an XML declaration, and otherwise reads Windows-1252, which older Windows exporters write.
+
+```rust
+let bytes = std::fs::read("export.ris")?;
+let decoded = biblio::decode(&bytes);
+println!("read as {}", decoded.encoding); // e.g. "windows-1252"
+if decoded.replaced {
+    eprintln!("some characters could not be read");
+}
+let parsed = biblio::ris::parse(&decoded.text)?;
+```
+
 ## Errors and diagnostics
 
 A bad record does not reject the whole file. Each parser keeps every record it can read and returns a `Parsed` with the `records` and a list of `diagnostics`, sorted by line, describing what it had to drop or patch: records without a title, `RIS` records not closed with `ER`, lines that belong to no record, `BibTeX` entries that could not be parsed, and `EndNote XML` that breaks off part way.
