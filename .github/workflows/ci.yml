@@ -65,6 +65,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Test with all features
+        run: cargo test --all-features
+
   release:
     name: Release
     needs: [ build, msrv ]
