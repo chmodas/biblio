@@ -23,8 +23,14 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// are separated by `;`. Every column without a field is kept in [`Record::extras`] as
 /// `"csv:{header}"`, with the header as written.
 ///
-/// New layouts may be added.
+/// New layouts may be added. With the `serde` feature, a layout is the JSON string `"generic"`,
+/// `"zotero"` or `"syrf"`; any other string cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[non_exhaustive]
 pub enum Layout {
     /// Columns named after the record's fields, matched in any case and ignoring surrounding

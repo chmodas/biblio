@@ -6,7 +6,15 @@ use crate::Record;
 ///
 /// Parsers keep every record they can. Anything they had to drop or patch is reported in
 /// `diagnostics`, sorted by line.
+///
+/// With the `serde` feature, it is `{"records": [...], "diagnostics": [...]}` in JSON; a member
+/// left out when reading is empty.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 #[non_exhaustive]
 pub struct Parsed {
     /// The records, in the order they appear in the input.
@@ -23,7 +31,18 @@ pub struct Parsed {
 /// one-indexed `line`: the line where the record or entry starts, or for [`Self::IgnoredLine`] and
 /// [`Self::Truncated`], the line concerned. New variants may be added, so a `match` needs a
 /// wildcard arm.
+///
+/// With the `serde` feature, a diagnostic is a JSON object whose `kind` names the variant in snake
+/// case, next to the variant's fields: `{"kind": "missing_title", "line": 3}`, `{"kind":
+/// "extra_cells", "line": 9, "count": 2}`. The `kind` names are part of the JSON format. An
+/// unknown `kind`, or a missing field, cannot be read; members the variant has no field for are
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "kind", rename_all = "snake_case")
+)]
 #[non_exhaustive]
 pub enum Diagnostic {
     /// The record has no title, or only a blank one. The record is kept.

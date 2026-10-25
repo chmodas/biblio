@@ -26,8 +26,22 @@ biblatex = "0.11"
 csv = "1.4"
 encoding_rs = "0.8"
 quick-xml = "0.39"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 winnow = "1"
+
+[features]
+# Serialize and Deserialize for records, diagnostics, errors and CSV layouts.
+serde = ["dep:serde"]
 
 [dev-dependencies]
 proptest = "1"
+serde_json = "1"
 test-strategy = "0.4"
+
+[[test]]
+name = "serde"
+path = "tests/serde.rs"
+required-features = ["serde"]
+
+[package.metadata.docs.rs]
+all-features = true
