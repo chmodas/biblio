@@ -1,8 +1,9 @@
 //! A library for converting between bibliographic reference formats.
 //!
 //! `biblio` provides a unified [`Record`] type that captures the metadata common to `RIS`, `NBIB`,
-//! `EndNote XML`, `BibTeX`, and `BibLaTeX` files. Each format has a dedicated module exposing the
-//! same `parse` / `serialize` pair:
+//! `EndNote XML`, `BibTeX`, `BibLaTeX` and CSV files. Each format has a dedicated module exposing
+//! the same `parse` / `serialize` pair; [`csv`] reads three column layouts, including Zotero's
+//! export, and can write each of them:
 //!
 //! ```
 //! use biblio::{bibtex, ris};
@@ -36,6 +37,7 @@
 //! assert_eq!(parsed.records[0].title.as_deref(), Some("Café"));
 //! ```
 pub mod bibtex;
+pub mod csv;
 mod decode;
 pub mod endnote_xml;
 mod error;

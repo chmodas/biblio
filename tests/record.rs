@@ -104,6 +104,10 @@ fn diagnostic_line_and_display() {
             },
             "field month of the entry at line 8 could not be read and was removed",
         ),
+        (
+            Diagnostic::ExtraCells { line: 9, count: 2 },
+            "row at line 9 has 2 more cells than the header; they were dropped",
+        ),
     ];
     for (expected_line, (diagnostic, text)) in (1..).zip(cases) {
         assert_eq!(diagnostic.line(), expected_line);

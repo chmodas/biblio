@@ -76,8 +76,8 @@ pub struct Record {
     /// Title of the publication, or `None` if the source has none.
     ///
     /// Parsers keep records without a title and report a [`Diagnostic::MissingTitle`] for a title
-    /// that is `None` or blank. `EndNote XML` reads an empty `<title/>` as `None`; the other
-    /// formats keep a blank title tag as `Some("")`.
+    /// that is `None` or blank. `EndNote XML` reads an empty `<title/>` as `None`, and CSV a blank
+    /// title cell; the other formats keep a blank title tag as `Some("")`.
     ///
     /// [`Diagnostic::MissingTitle`]: crate::Diagnostic::MissingTitle
     pub title: Option<String>,
@@ -121,7 +121,8 @@ pub struct Record {
     /// `RIS` reads and writes it as `DB`, and `EndNote XML` as `<remote-database-name>`. `NBIB` and
     /// `BibTeX` neither read nor write it, so converting a record to them drops the database from
     /// the output but not from the record. `RIS` keeps a blank `DB` as `Some("")`; `EndNote XML`
-    /// ignores an empty element.
+    /// ignores an empty element. The generic CSV layout reads it from a `source` or `database`
+    /// column and writes it as `source`; the other CSV layouts have no column for it.
     pub database: Option<String>,
 
     /// A user's label on the record, as written in the source (e.g. `"OLD"`, `"included"`).
@@ -130,7 +131,8 @@ pub struct Record {
     /// neither read nor write it, so converting a record to them drops the label from the output
     /// but not from the record; a `BibTeX` `label` field is a substitute citation label, not a
     /// user's label, and stays in [`Record::extras`]. `RIS` keeps a blank `LB` as `Some("")`;
-    /// `EndNote XML` ignores an empty element.
+    /// `EndNote XML` ignores an empty element. The generic CSV layout reads and writes it as
+    /// `label`; the other CSV layouts have no column for it.
     pub label: Option<String>,
 
     /// Keywords and subject headings, in source order (e.g. `"Alzheimer Disease"`).
@@ -140,7 +142,8 @@ pub struct Record {
     /// and `;` inside a keyword in braces. `NBIB` reads them from `OT` and from the subject
     /// headings in `MH`, and writes them all as `OT`. Values are trimmed and blank ones dropped;
     /// duplicates are kept. Serialisers skip blank values. `BibTeX` turns `--` into a dash and
-    /// collapses whitespace in `keywords`, as in every field.
+    /// collapses whitespace in `keywords`, as in every field. CSV holds them in one cell,
+    /// separated by `;`.
     pub keywords: Vec<String>,
 
     /// Links to the record, in source order (e.g. `"https://doi.org/10.1000/xyz"`).
@@ -149,7 +152,9 @@ pub struct Record {
     /// as `url`, which holds one link, so only the first is written. `NBIB` has no tag for links,
     /// so it never sets them or writes them. Values are trimmed and blank ones dropped;
     /// duplicates are kept. Serialisers skip blank values. `BibTeX` turns `--` into a dash and
-    /// collapses whitespace in `url`, as in every field.
+    /// collapses whitespace in `url`, as in every field. The generic CSV layout holds them in one
+    /// cell, separated by `;`; the Zotero and `SyRF` layouts hold one link, so only the first is
+    /// written.
     pub urls: Vec<String>,
 
     /// Every field of the source that has no slot above, keyed by format and tag, with its values
@@ -163,11 +168,12 @@ pub struct Record {
     ///   `"bibtex:@key"` for the citation key and `"bibtex:@type"` for the entry type. A field name
     ///   cannot contain `@`, so these never clash with a real field.
     /// - `EndNote XML`: the element path below `<record>`, e.g. `"endnote:urls/pdf-urls/url"`.
+    /// - CSV: the column's header as written, e.g. `"csv:record_id"`, `"csv:Item Type"`.
     ///
     /// Each serialiser writes only the keys of its own format, so values read from one format are
     /// kept on the record but not written to another. It skips keys that are not valid tags in its
-    /// format, and keys for tags it reads into the fields above. `BibTeX` writes only the first
-    /// value of a key, because a field can appear only once in an entry.
+    /// format, and keys for tags it reads into the fields above. `BibTeX` and CSV write only the
+    /// first value of a key, because a field or cell holds one value.
     pub extras: HashMap<String, Vec<String>>,
 }
 

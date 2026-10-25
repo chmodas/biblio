@@ -3,7 +3,7 @@
 [![CI](https://github.com/chmodas/biblio/actions/workflows/ci.yml/badge.svg)](https://github.com/chmodas/biblio/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/chmodas/biblio/graph/badge.svg?token=5KAFOZEH6G)](https://codecov.io/gh/chmodas/biblio)
 
-biblio parses and serializes **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, and **BibLaTeX** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
+biblio parses and serializes **RIS**, **NBIB (PubMed)**, **EndNote XML**, **BibTeX**, **BibLaTeX** and **CSV** through a single unified `Record` type, so you can read references in one format and write them in another without hand-rolling format-specific logic.
 
 > **Work in progress.** The current `Record` carries the minimum useful set of fields (title, authors, date, journal, DOI, pages, volume, number, abstract, ISBN/ISSN, source database, label, keywords, URLs). Additional fields – publication type, language, funding, affiliations, and more – will be added in upcoming releases.
 
@@ -59,6 +59,24 @@ let rec = Record::builder()
 `Record`, `Parsed`, `Diagnostic` and `Error` are `#[non_exhaustive]`, so fields and variants can be added without breaking your code: build records with the builder, and give a `match` on `Diagnostic` or `Error` a wildcard arm.
 
 The title is optional, because some records have none. Every field without a slot of its own lands in `extras: HashMap<String, Vec<String>>`, keyed by format and tag (`"ris:N1"`, `"nbib:PMID"`, `"bibtex:note"`, `"endnote:urls/pdf-urls/url"`, …) with its values in order, so fields without a slot are no longer dropped. Each serialiser writes back only the extras of its own format: converting BibTeX to RIS keeps the BibTeX-only fields on the record but does not write them into the RIS.
+
+## CSV
+
+`biblio::csv` reads three column layouts, detected from the header row, and writes each of them:
+
+- **Generic**: columns named after the record's fields (`title`, `author`, `year`, `date`, `journal`, `doi`, `pages`, `volume`, `number`, `abstract`, `isbn`, `source`, `label`, `keywords`, `url`), matched in any case. A cell of exactly `NA` is read as blank, as R writes missing values.
+- **Zotero**: Zotero's CSV export.
+- **SyRF**: the SyRF import layout.
+
+Authors, keywords and links in one cell are separated by `;`. Files separated by `;` instead of `,` are read too. Other columns are kept in `extras` and written back.
+
+```rust
+let parsed = biblio::csv::parse(&text)?;
+let layout = biblio::csv::detect_layout(&text);
+let csv = biblio::csv::serialize_as(layout, &parsed.records);
+```
+
+Cells are written as they are, so one starting with `=`, `+`, `-` or `@` may be run as a formula by a spreadsheet program. If you offer CSV built from untrusted records for download, neutralise such cells first.
 
 ## Reading files in other encodings
 

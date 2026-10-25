@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/chmodas/biblio"
 homepage = "https://github.com/chmodas/biblio"
 readme = "README.md"
-description = "Parse and serialize bibliographic records across RIS, NBIB, EndNote XML, and BibTeX/BibLaTeX formats."
+description = "Parse and serialize bibliographic records across RIS, NBIB, EndNote XML, BibTeX/BibLaTeX and CSV formats."
 categories = ["parsing"]
 keywords = ["bibliography", "text-processing", "science"]
 rust-version = "1.85.0"
@@ -23,6 +23,7 @@ pedantic = "warn"
 
 [dependencies]
 biblatex = "0.11"
+csv = "1.4"
 encoding_rs = "0.8"
 quick-xml = "0.39"
 winnow = "1"
