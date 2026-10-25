@@ -83,13 +83,22 @@ pub enum Diagnostic {
         field: String,
     },
 
-    /// The input broke off: an `EndNote XML` syntax error, or the end of the input inside a record.
-    /// The records before it are kept, the record in progress is dropped, and parsing stops.
+    /// The input broke off: an `EndNote XML` syntax error, the end of the input inside an `EndNote
+    /// XML` record, or a CSV quoted cell left open at the end of the input. The records before it
+    /// are kept, the record in progress is dropped, and parsing stops.
     Truncated {
         /// Line of the syntax error, or where the unfinished record starts.
         line: usize,
         /// What went wrong.
         message: String,
+    },
+    /// A CSV row has more cells than the header, and at least one of the surplus cells is not
+    /// blank. The surplus cells are dropped and the record is kept.
+    ExtraCells {
+        /// Line where the row starts.
+        line: usize,
+        /// How many more cells than the header the row has.
+        count: usize,
     },
 }
 
@@ -105,7 +114,8 @@ impl Diagnostic {
             | Self::ReferenceTooDeep { line }
             | Self::DroppedField { line, .. }
             | Self::SkippedEntry { line, .. }
-            | Self::Truncated { line, .. } => *line,
+            | Self::Truncated { line, .. }
+            | Self::ExtraCells { line, .. } => *line,
         }
     }
 }
@@ -137,6 +147,12 @@ impl fmt::Display for Diagnostic {
             ),
             Self::Truncated { line, message } => {
                 write!(f, "input truncated at line {line}: {message}")
+            }
+            Self::ExtraCells { line, count } => {
+                write!(
+                    f,
+                    "row at line {line} has {count} more cells than the header; they were dropped"
+                )
             }
         }
     }
