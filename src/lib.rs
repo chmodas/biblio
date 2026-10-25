@@ -36,6 +36,23 @@
 //! let parsed = biblio::ris::parse(&decoded.text).unwrap();
 //! assert_eq!(parsed.records[0].title.as_deref(), Some("Café"));
 //! ```
+//!
+//! # Features
+//!
+//! - `serde`: `Serialize` and `Deserialize` for [`Record`], [`PublicationDate`], [`Parsed`],
+//!   [`Diagnostic`], [`Error`] and [`csv::Layout`], so parse results can be sent as JSON.
+//!   Diagnostics and errors are tagged by a `kind` member:
+//!
+//! ```
+//! # #[cfg(feature = "serde")]
+//! # {
+//! let parsed = biblio::ris::parse("TY  - JOUR\nER  -\n").unwrap();
+//! let json = serde_json::to_value(&parsed).unwrap();
+//! assert_eq!(json["diagnostics"][0]["kind"], "missing_title");
+//! let back: biblio::Parsed = serde_json::from_value(json).unwrap();
+//! assert_eq!(back, parsed);
+//! # }
+//! ```
 pub mod bibtex;
 pub mod csv;
 mod decode;

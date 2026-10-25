@@ -105,6 +105,22 @@ for diagnostic in &parsed.diagnostics {
 
 `Err` is kept for problems with the whole input: empty input, or `EndNote XML` that breaks off before any record is complete.
 
+## Optional features
+
+- **`serde`**: `Serialize` and `Deserialize` for `Record`, `PublicationDate`, `Parsed`, `Diagnostic`, `Error` and `csv::Layout`, so parse results can be sent as JSON. Diagnostics and errors are objects tagged by `kind` (`{"kind": "missing_title", "line": 3}`), and CSV layouts are lower-case strings. A record is an object with a member for every field; when reading, missing members take their empty value and unknown ones are ignored.
+
+```sh
+cargo add biblio --features serde
+```
+
+```rust
+let parsed = biblio::ris::parse("TY  - JOUR\nER  -\n")?;
+let json = serde_json::to_value(&parsed)?;
+assert_eq!(json["diagnostics"][0]["kind"], "missing_title");
+```
+
+Line numbers are written as JSON integers; JavaScript reads those above 2^53 inexactly, which no real input reaches.
+
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

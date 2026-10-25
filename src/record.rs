@@ -25,7 +25,13 @@
 /// };
 /// assert_eq!(date.to_string(), "2024-09-01");
 /// ```
+///
+/// With the `serde` feature, a date is `{"year": 2024, "month": 9, "day": null}` in JSON. `month`
+/// and `day` may be left out; `year` may not. Any value of a field's type is read, so a month or
+/// day out of range is kept as given, but one that does not fit the type, or a number with a
+/// fraction, cannot be read. Members the date has no field for are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PublicationDate {
     /// The year of publication.
     pub year: i32,
@@ -70,7 +76,22 @@ use std::collections::HashMap;
 /// ```
 ///
 /// The fields stay public, so a record can also be changed after it is built.
+///
+/// # JSON
+///
+/// With the `serde` feature, a record is a JSON object with a member for every field, named as
+/// here: `null` for a field without a value, `[]` for an empty list, and `extras` as an object of
+/// string arrays, whose members come in no particular order. When reading, a member that is left
+/// out takes its empty value, and a member the record has no field for is ignored, so JSON written
+/// by a release with more fields can still be read. `null` is accepted only for optional fields.
+/// The record may also be read from an array of its fields in order, missing ones taking their
+/// empty value; it is never written that way.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 #[non_exhaustive]
 pub struct Record {
     /// Title of the publication, or `None` if the source has none.
