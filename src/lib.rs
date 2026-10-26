@@ -58,6 +58,7 @@ pub mod csv;
 mod decode;
 pub mod endnote_xml;
 mod error;
+mod identifier;
 pub mod nbib;
 mod parse_util;
 mod parsed;

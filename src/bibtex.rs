@@ -21,9 +21,10 @@ use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{one_of, take_while};
 
+use crate::identifier;
 use crate::parse_util::{
-    check_empty, first_non_blank, non_blank, non_blank_values, own_extras, parsed,
-    report_missing_title, strip_byte_order_mark,
+    check_empty, non_blank, non_blank_values, own_extras, parsed, report_missing_title,
+    strip_byte_order_mark,
 };
 use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 
@@ -100,8 +101,8 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// `"January"`), braces are removed and whitespace is collapsed, so a value may change once when it
 /// is first read. A `crossref` child's extras include the fields it inherits, and `crossref` itself
 /// is kept; `xdata` is consumed while resolving and is not kept. A field that appears twice keeps
-/// its last value. Fields that are read but lose to another are dropped: `issn` when `isbn` is
-/// present, `journal` when `journaltitle` is present, and values of `date`, `year` or `author`
+/// its last value. Fields that are read but lose to another are dropped: `journal` when
+/// `journaltitle` is present, and values of `date`, `year` or `author`
 /// that cannot be read. The date comes from `date` when it gives one, and from `year` otherwise,
 /// so a readable `year` is dropped only when `date` can be read; a blank or unreadable `date`
 /// falls back to `year`. A `crossref` child of a type that inherits its parent's date, such as an
@@ -131,10 +132,11 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 ///
 /// # Identifiers
 ///
-/// The identifier is read from `isbn`, falling back to `issn`. A blank `isbn` never hides an `issn`
-/// with a value. The value is trimmed but not split or normalised, so a field listing several
-/// identifiers stays one string; the underlying parser still collapses whitespace and turns `--`
-/// into a dash.
+/// The identifier is chosen from the identifiers listed in `isbn`, or in `issn` when `isbn` is
+/// absent, blank or only separators, by the rule described at [`Record::isbn`], so an ISBN is kept
+/// even when a lower ISSN is listed beside it. The others in that field are kept in its extra,
+/// `"bibtex:isbn"` or `"bibtex:issn"`, and every identifier in the other field in that field's
+/// extra. The underlying parser collapses whitespace and turns `--` into a dash first.
 pub fn parse(input: &str) -> Result<Parsed, Error> {
     let input = strip_byte_order_mark(input);
     check_empty(input)?;
@@ -310,7 +312,9 @@ fn lines_of(input: &str, offsets: &[usize]) -> Vec<usize> {
 /// The entry type and citation key come from `extras["bibtex:@type"]` and `extras["bibtex:@key"]`,
 /// falling back to `article` and `unknown` when absent or not valid. Other `bibtex:` extras are
 /// written as fields after the first-class fields, sorted by name, using only their first value;
-/// names that are not valid field names, and fields the parser reads, are skipped. A `crossref`
+/// names that are not valid field names, and fields the parser reads, are skipped. The exception
+/// is the identifiers listed beside [`Record::isbn`]: `isbn` holds it and then every value of
+/// `bibtex:isbn`, and `issn` every value of `bibtex:issn`, joined with `, `. A `crossref`
 /// that would close a cycle among the records written (to the entry itself, directly or through an
 /// `ids` alias, or through other entries) is skipped too, because such an entry cannot be resolved.
 /// Extras of other formats are not written, nor are [`Record::database`] and [`Record::label`].
@@ -388,8 +392,22 @@ pub fn serialize(records: &[Record]) -> String {
             emit(&mut out, "abstract", abstract_text);
         }
 
-        if let Some(isbn) = &record.isbn {
-            emit(&mut out, "isbn", isbn);
+        // The identifier and the others listed beside it share one field.
+        let isbns: Vec<&str> = record
+            .isbn
+            .iter()
+            .chain(record.extras.get("bibtex:isbn").into_iter().flatten())
+            .map(String::as_str)
+            .collect();
+        if !isbns.is_empty() {
+            emit(&mut out, "isbn", &isbns.join(", "));
+        }
+        if let Some(issns) = record
+            .extras
+            .get("bibtex:issn")
+            .filter(|issns| !issns.is_empty())
+        {
+            emit(&mut out, "issn", &issns.join(", "));
         }
 
         let keywords: Vec<String> = non_blank_values(&record.keywords)
@@ -670,7 +688,7 @@ fn record_from_entry(
             .get(name)
             .map(|chunks| chunks.format_verbatim().trim().to_owned())
     };
-    let isbn = first_non_blank([field("isbn"), field("issn")]);
+    let isbn = read_identifiers([field("isbn"), field("issn")], &mut extras);
     let keywords = entry.get("keywords").map_or_else(Vec::new, split_keywords);
     let urls = non_blank(field("url").into_iter().collect());
 
@@ -691,6 +709,39 @@ fn record_from_entry(
         urls,
         extras,
     }
+}
+
+/// Choose the identifier from the values of the `isbn` and `issn` fields, in that order.
+///
+/// It is chosen from the first field that lists an identifier or other text, or from the first
+/// field present when every one is blank or only separators, and the rest of that field goes to its
+/// `bibtex:` extra. Every candidate in the other field goes to that field's extra, so an `issn`
+/// beside an `isbn` is kept.
+fn read_identifiers(
+    fields: [Option<String>; 2],
+    extras: &mut HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let preferred = fields
+        .iter()
+        .position(|value| {
+            value
+                .as_ref()
+                .is_some_and(|value| !identifier::split(value).is_empty())
+        })
+        .or_else(|| fields.iter().position(Option::is_some));
+    let mut isbn = None;
+    for (index, (name, value)) in ["isbn", "issn"].into_iter().zip(fields).enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        let key = format!("bibtex:{name}");
+        if Some(index) == preferred {
+            isbn = identifier::choose_into([value.as_str()], extras, &key);
+        } else {
+            identifier::split_into(&value, extras, &key);
+        }
+    }
+    isbn
 }
 
 /// Format a [`Person`] as `"Last, First"` (the convention used by [`Record::authors`]).

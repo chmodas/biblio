@@ -11,8 +11,8 @@ use biblio::nbib::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::{
-    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_raw_value, arb_text, arb_url,
-    arb_volume, first_extra,
+    IdentifierValues, arb_author, arb_blank, arb_date, arb_identifier_values, arb_keyword,
+    arb_pages, arb_raw_value, arb_text, arb_url, arb_volume, first_extra,
 };
 
 // -- Core parsing --
@@ -1006,10 +1006,12 @@ fn extras_hold_exactly_the_unread_tags(#[strategy("[A-Z0-9]{2,4}")] tag: String)
     prop_assert_eq!(kept, !NBIB_READ_TAGS.contains(&tag.as_str()));
 }
 
-/// An extra naming a tag the parser reads is never written, so it cannot leak into a field.
+/// An extra naming a tag the parser reads is never written, so it cannot leak into a field. `IS` is
+/// left out: the other identifiers are written from `nbib:IS` by design.
 #[proptest]
 fn read_tags_never_written_from_extras(
-    #[strategy(select(NBIB_READ_TAGS.to_vec()))] tag: &'static str,
+    #[strategy(select(NBIB_READ_TAGS.iter().copied().filter(|tag| *tag != "IS").collect::<Vec<_>>()))]
+    tag: &'static str,
     #[strategy(arb_nbib_record())] record: Record,
 ) {
     let mut with_read_tag = record.clone();
@@ -1121,4 +1123,60 @@ fn records_stable_through_serialize(
     let first = parse(&input).unwrap().records;
     let second = parse(&serialize(&first)).unwrap().records;
     prop_assert_eq!(second, first);
+}
+
+// -- Identifiers --
+
+/// The record read from `tag_lines` after a `PMID`.
+fn record_with(tag_lines: &str) -> Record {
+    parse(&format!("PMID- 1\nTI  - T\n{tag_lines}"))
+        .unwrap()
+        .records
+        .remove(0)
+}
+
+/// A record's print, electronic and linking ISSNs give the lowest, without its label, and the
+/// others are kept in `nbib:IS` as written, in order.
+#[test]
+fn several_is_lines_give_the_lowest() {
+    let record = record_with(
+        "IS  - 1939-1676 (Electronic)\nIS  - 0891-6640 (Print)\nIS  - 0891-6640 (Linking)\n",
+    );
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(
+        record.extras["nbib:IS"],
+        ["1939-1676 (Electronic)", "0891-6640 (Print)"]
+    );
+}
+
+/// A continuation line of `IS` is joined to it, so its identifier is read too.
+#[test]
+fn is_continuation_read() {
+    let record = record_with("IS  - 1939-1676\n      0891-6640\n");
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(record.extras["nbib:IS"], ["1939-1676"]);
+}
+
+/// The chosen identifier is written first, then one `IS` per other identifier, and reading the
+/// output gives the same record.
+#[test]
+fn identifiers_written_back() {
+    let record = record_with("IS  - 1939-1676 (Electronic)\nIS  - 0891-6640 (Linking)\n");
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("IS  - 0891-6640\nIS  - 1939-1676 (Electronic)\n"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// Identifiers listed in any number of `IS` lines give the lowest, and writing and reading the
+/// record again gives the same record.
+#[proptest]
+fn identifiers_round_trip(#[strategy(arb_identifier_values())] listed: IdentifierValues) {
+    let mut tag_lines = String::new();
+    for value in &listed.values {
+        writeln!(tag_lines, "IS  - {value}").unwrap();
+    }
+    let record = record_with(&tag_lines);
+    prop_assert_eq!(record.isbn.as_deref(), Some(listed.lowest()));
+    let output = serialize(std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
 }

@@ -11,6 +11,7 @@ use std::ops::ControlFlow;
 use quick_xml::events::{BytesCData, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 
+use crate::identifier;
 use crate::parse_util::{
     check_empty, non_blank, non_blank_values, own_extras, parsed, push_extra, report_missing_title,
     strip_byte_order_mark,
@@ -45,6 +46,13 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// child elements hold values, and empty ones are skipped. Attributes, such as the name in
 /// `<ref-type name="Journal Article">`, are not kept. Dates in `dates/year` that cannot be read are
 /// dropped.
+///
+/// # Identifiers
+///
+/// Every element at a path ending in `isbn` lists identifiers, separated by a space or a line
+/// break as `EndNote` writes them (`1939-1676&#xD;0891-6640`). One is kept in [`Record::isbn`] by
+/// the rule described there, and the others in `"endnote:isbn"`. Elements of only whitespace or
+/// separators give no identifier.
 ///
 /// A leading byte-order mark is ignored.
 ///
@@ -250,8 +258,10 @@ impl<'a> Walker<'a> {
 /// block per key, sorted by path, with one element per non-empty value; a key may therefore add a
 /// second container such as `<titles>` or `<urls>`. Paths with an empty or non-ASCII element name,
 /// with a `record` or `style` element, or that the parser reads into a field are skipped, so some
-/// paths that parsing produces are not written. Extras of other formats are not written. Blank
-/// keywords and links are skipped, and an empty list writes no container.
+/// paths that parsing produces are not written. The exception is `endnote:isbn`, the identifiers
+/// listed beside [`Record::isbn`], which are written after it in one `<isbn>`, joined with `; `.
+/// Extras of other formats are not written. Blank keywords and links are skipped, and an empty list
+/// writes no container.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut writer = Writer::new(Vec::new());
@@ -333,8 +343,15 @@ fn write_record(writer: &mut Writer<Vec<u8>>, record: &Record) {
         write_simple_element(writer, "abstract", abstract_text);
     }
 
-    if let Some(isbn) = &record.isbn {
-        write_simple_element(writer, "isbn", isbn);
+    // The identifier and the others listed beside it share one element.
+    let isbns: Vec<&str> = record
+        .isbn
+        .iter()
+        .chain(record.extras.get("endnote:isbn").into_iter().flatten())
+        .map(String::as_str)
+        .collect();
+    if !isbns.is_empty() {
+        write_simple_element(writer, "isbn", &isbns.join("; "));
     }
 
     if let Some(database) = &record.database {
@@ -481,7 +498,9 @@ struct PendingRecord {
     volume: Option<String>,
     number: Option<String>,
     abstract_text: Option<String>,
-    isbn: Option<String>,
+    /// The text of every element read as an identifier, from which [`PendingRecord::finish`]
+    /// chooses one.
+    isbns: Vec<String>,
     database: Option<String>,
     label: Option<String>,
     keywords: Vec<String>,
@@ -549,7 +568,7 @@ impl PendingRecord {
             Some(ReadField::Volume) => self.volume = value,
             Some(ReadField::Number) => self.number = value,
             Some(ReadField::Abstract) => self.abstract_text = value,
-            Some(ReadField::Isbn) => self.isbn = value,
+            Some(ReadField::Isbn) => self.isbns.push(text.to_owned()),
             Some(ReadField::Database) => self.database = value,
             Some(ReadField::Label) => self.label = value,
             Some(ReadField::Keyword) => self.keywords.push(text.to_owned()),
@@ -575,6 +594,15 @@ impl PendingRecord {
                 day: None,
             });
 
+        let mut extras = self.extras;
+        // An empty identifier would be written as an empty element, which is not read back.
+        let isbn = identifier::choose_into(
+            self.isbns.iter().map(String::as_str),
+            &mut extras,
+            "endnote:isbn",
+        )
+        .filter(|isbn| !isbn.is_empty());
+
         Record {
             title: self.title,
             authors: self.authors,
@@ -585,12 +613,12 @@ impl PendingRecord {
             volume: self.volume,
             number: self.number,
             abstract_text: self.abstract_text,
-            isbn: self.isbn,
+            isbn,
             database: self.database,
             label: self.label,
             keywords: non_blank(self.keywords),
             urls: non_blank(self.urls),
-            extras: self.extras,
+            extras,
         }
     }
 }

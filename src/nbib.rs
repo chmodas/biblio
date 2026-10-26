@@ -12,6 +12,7 @@ use winnow::Parser;
 use winnow::ascii::space0;
 use winnow::token::{rest, take_while};
 
+use crate::identifier;
 use crate::parse_util::{
     append_to_last, append_to_opt, check_empty, first_non_blank, non_blank, non_blank_values,
     normalize_line_endings, own_extras, parsed, push_extra, report_missing_title,
@@ -34,8 +35,8 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Every tag without a field is kept in [`Record::extras`] as `"nbib:{tag}"` (e.g. `"nbib:PMID"`,
 /// `"nbib:GR"`), one value per occurrence, with its continuation lines joined. Tags that are read
 /// but lose to another are dropped: `AU` when `FAU` is present, `BTI` when `TI` is present, `CTI`
-/// when `JT` is present, `LID` and `AID` values that are not the DOI, all but the last `IS`, and
-/// dates in `DP` that cannot be read.
+/// when `JT` is present, `LID` and `AID` values that are not the DOI, and dates in `DP` that
+/// cannot be read.
 ///
 /// `NBIB` has no tag for the source database, a user's label or links, so [`Record::database`],
 /// [`Record::label`] and [`Record::urls`] are never set.
@@ -45,6 +46,12 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Each `OT` (other term) and each subject heading in `MH` adds one keyword to
 /// [`Record::keywords`], in the order they appear. Values are trimmed, and blank ones are dropped.
 /// The owner of the other terms, `OTO`, stays in extras.
+///
+/// # Identifiers
+///
+/// Every `IS`, such as `IS  - 0891-6640 (Print)`, lists identifiers; an export gives the print,
+/// electronic and linking ISSNs on separate lines. One is kept in [`Record::isbn`] by the rule
+/// described there, and the others in `"nbib:IS"`.
 ///
 /// # Errors
 ///
@@ -119,10 +126,11 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// Authors are emitted as `FAU` (full author) tags. DOIs are written as `LID` tags with a `[doi]`
 /// suffix. `nbib:` extras are written as tags before the fields, `PMID` first and the rest sorted
 /// by tag; keys that are not 2–4 character tags, and tags the parser reads into fields, are
-/// skipped. Keywords are written as `OT`, so a subject heading read from `MH` is written back as
-/// `OT`; blank keywords are skipped. Extras of other formats are not written, nor are
-/// [`Record::database`], [`Record::label`] and [`Record::urls`]. Records are separated by blank
-/// lines.
+/// skipped. The exception is `nbib:IS`, the identifiers listed beside [`Record::isbn`], which are
+/// written as `IS` lines after it. Keywords are written as `OT`, so a subject heading read from
+/// `MH` is written back as `OT`; blank keywords are skipped. Extras of other formats are not
+/// written, nor are [`Record::database`], [`Record::label`] and [`Record::urls`]. Records are
+/// separated by blank lines.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -180,6 +188,9 @@ pub fn serialize(records: &[Record]) -> String {
         }
 
         if let Some(isbn) = &record.isbn {
+            write_field(&mut buf, "IS", isbn);
+        }
+        for isbn in record.extras.get("nbib:IS").into_iter().flatten() {
             write_field(&mut buf, "IS", isbn);
         }
 
@@ -338,7 +349,8 @@ struct PendingRecord {
     volume: Option<String>,
     number: Option<String>,
     abstract_text: Option<String>,
-    isbn: Option<String>,
+    /// The value of every `IS`, from which [`PendingRecord::finish`] chooses the identifier.
+    isbns: Vec<String>,
     /// Keywords from `OT` and `MH`, in source order.
     keywords: Vec<String>,
     /// Values of tags that are not read into a field, keyed `"nbib:{tag}"`.
@@ -361,7 +373,7 @@ impl PendingRecord {
             "VI" => self.volume = Some(value.to_owned()),
             "IP" => self.number = Some(value.to_owned()),
             "AB" => self.abstract_text = Some(value.to_owned()),
-            "IS" => self.isbn = Some(value.to_owned()),
+            "IS" => self.isbns.push(value.to_owned()),
             "OT" | "MH" => self.keywords.push(value.to_owned()),
             // Keep this list in step with `is_read_tag`.
             _ => push_extra(&mut self.extras, format!("nbib:{tag}"), value),
@@ -384,6 +396,7 @@ impl PendingRecord {
             "FAU" => append_to_last(&mut self.fau_authors, text),
             "AU" => append_to_last(&mut self.au_authors, text),
             "LID" | "AID" => append_to_last(&mut self.doi_candidates, text),
+            "IS" => append_to_last(&mut self.isbns, text),
             // Both tags feed one list, so the last keyword is the one being continued.
             "OT" | "MH" => append_to_last(&mut self.keywords, text),
             _ => {
@@ -407,6 +420,12 @@ impl PendingRecord {
         };
 
         let doi = extract_doi(&self.doi_candidates);
+        let mut extras = self.extras;
+        let isbn = identifier::choose_into(
+            self.isbns.iter().map(String::as_str),
+            &mut extras,
+            "nbib:IS",
+        );
 
         Record {
             title,
@@ -418,12 +437,12 @@ impl PendingRecord {
             volume: self.volume,
             number: self.number,
             abstract_text: self.abstract_text,
-            isbn: self.isbn,
+            isbn,
             database: None,
             label: None,
             keywords: non_blank(self.keywords),
             urls: Vec::new(),
-            extras: self.extras,
+            extras,
         }
     }
 }

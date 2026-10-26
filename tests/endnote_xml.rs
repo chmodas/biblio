@@ -9,7 +9,8 @@ use biblio::endnote_xml::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::{
-    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_url, arb_volume, first_extra,
+    IdentifierValues, arb_author, arb_blank, arb_date, arb_identifier_values, arb_keyword,
+    arb_pages, arb_url, arb_volume, first_extra,
 };
 
 // -- Core parsing --
@@ -1000,10 +1001,13 @@ const ENDNOTE_READ_PATHS: [&str; 14] = [
 ];
 
 /// An extra whose path the parser reads into a field is never written, so it cannot leak into the
-/// field.
+/// field. `isbn` is left out: the other identifiers are written from `endnote:isbn` by design.
 #[proptest]
 fn read_paths_never_written_from_extras(
-    #[strategy(proptest::sample::select(ENDNOTE_READ_PATHS.to_vec()))] path: &'static str,
+    #[strategy(proptest::sample::select(
+        ENDNOTE_READ_PATHS.iter().copied().filter(|path| *path != "isbn").collect::<Vec<_>>()
+    ))]
+    path: &'static str,
     #[strategy(arb_endnote_record())] record: Record,
 ) {
     let mut with_read_path = record.clone();
@@ -1097,4 +1101,76 @@ fn keywords_match_reference(
         .filter(|value| !value.is_empty())
         .collect();
     prop_assert_eq!(record.keywords, reference);
+}
+
+// -- Identifiers --
+
+/// Identifiers separated by a space or a carriage return in one `<isbn>`, as `EndNote` and Zotero
+/// write them, give the lowest, and the others are kept in `endnote:isbn` as written.
+#[test]
+fn identifiers_in_one_isbn_are_split() {
+    let spaced = parse_record("<isbn>1939-1676 0891-6640</isbn>");
+    assert_eq!(spaced.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(spaced.extras["endnote:isbn"], ["1939-1676"]);
+    let lines = parse_record("<isbn>1939-1676 (Electronic)&#xD;0891-6640 (Print)</isbn>");
+    assert_eq!(lines.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(lines.extras["endnote:isbn"], ["1939-1676 (Electronic)"]);
+}
+
+/// A second `<isbn>` element adds its identifiers instead of replacing the first one's.
+#[test]
+fn several_isbn_elements_read() {
+    let record = parse_record("<isbn>0891-6640</isbn><isbn>1939-1676</isbn>");
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(record.extras["endnote:isbn"], ["1939-1676"]);
+}
+
+/// The identifiers are written in one `<isbn>`, the chosen one first, joined with `; `, and
+/// reading the output gives the same record.
+#[test]
+fn identifiers_written_back() {
+    let record = parse_record("<isbn>1939-1676 (Electronic)&#xD;0891-6640 (Print)</isbn>");
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("<isbn>0891-6640; 1939-1676 (Electronic)</isbn>"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// Identifiers kept in `endnote:isbn` are written even when the record has no identifier of its
+/// own, and the lowest is chosen when they are read back.
+#[test]
+fn identifier_extras_written_without_identifier() {
+    let record = Record::builder()
+        .title("t")
+        .extra("endnote:isbn", "1939-1676")
+        .extra("endnote:isbn", "0891-6640")
+        .build();
+    let output = serialize(&[record]);
+    assert!(output.contains("<isbn>1939-1676; 0891-6640</isbn>"));
+    let back = parse(&output).unwrap().records.remove(0);
+    assert_eq!(back.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(back.extras["endnote:isbn"], ["1939-1676"]);
+}
+
+/// Identifiers listed in any number of `<isbn>` elements give the lowest, and writing and reading
+/// the record again gives the same record.
+#[proptest]
+fn identifiers_round_trip(#[strategy(arb_identifier_values())] listed: IdentifierValues) {
+    let mut elements = String::new();
+    for value in &listed.values {
+        write!(elements, "<isbn>{value}</isbn>").unwrap();
+    }
+    let record = parse_record(&elements);
+    prop_assert_eq!(record.isbn.as_deref(), Some(listed.lowest()));
+    let output = serialize(std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// An `<isbn>` of only whitespace, a line break or separators gives no identifier, because an
+/// empty element cannot be written back. Regression test: it gave an empty identifier, which was
+/// written as an empty element and read back as none.
+#[test]
+fn identifier_without_candidates_is_none() {
+    for element in ["<isbn>&#xD;</isbn>", "<isbn>   </isbn>", "<isbn>;</isbn>"] {
+        assert_eq!(parse_record(element).isbn, None, "{element}");
+    }
 }

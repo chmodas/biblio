@@ -11,7 +11,7 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::csv::{Layout, detect_layout, parse, parse_as, serialize, serialize_as};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_date, arb_url, first_extra};
+use common::{IdentifierValues, arb_date, arb_identifier_values, arb_url, first_extra};
 
 /// The single record of `input`, read with its layout detected.
 fn only_record(input: &str) -> Record {
@@ -159,7 +159,8 @@ fn zotero_columns_read() {
     assert_eq!(record.authors, vec!["Rotter, Carina", "Rusbridge, Clare"]);
     assert_eq!(record.title.as_deref(), Some("Myoclonus"));
     assert_eq!(record.journal.as_deref(), Some("J Vet Intern Med"));
-    assert_eq!(record.isbn.as_deref(), Some("1939-1676 0891-6640"));
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(record.extras["csv:ISSN"], ["1939-1676"]);
     assert_eq!(record.doi.as_deref(), Some("10.1111/jvim.16404"));
     assert_eq!(record.urls, vec!["https://example.org"]);
     assert_eq!(record.abstract_text.as_deref(), Some("An abstract"));
@@ -182,7 +183,7 @@ fn zotero_columns_read() {
     );
     assert_eq!(first_extra(&record, "csv:Automatic Tags"), Some("auto"));
     assert_eq!(first_extra(&record, "csv:Extra"), Some("PMID: 35319117"));
-    assert_eq!(record.extras.len(), 4);
+    assert_eq!(record.extras.len(), 5);
 }
 
 /// Zotero's `ISBN` is preferred over `ISSN`, which is then kept in extras.
@@ -505,6 +506,14 @@ fn arb_cell() -> impl Strategy<Value = String> {
         .prop_filter("NA is read as blank", |cell| cell != "NA")
 }
 
+/// One ISSN or ISBN, as a record holds it once read: a single identifier without labels.
+fn arb_identifier() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[0-9]{4}-[0-9]{3}[0-9X]",
+        "97[89]-[0-9]{1,2}-[0-9]{3,4}-[0-9]{3,4}-[0-9X]",
+    ]
+}
+
 /// One value of a list cell: as [`arb_cell`], but without `;` or line breaks.
 fn arb_list_value() -> impl Strategy<Value = String> {
     "[A-Za-z0-9é\"',.()-]([A-Za-z0-9é\"',.() -]{0,20}[A-Za-z0-9é\"',.()-])?"
@@ -549,7 +558,7 @@ fn arb_csv_record(layout: Layout) -> impl Strategy<Value = Record> {
     );
     (
         (scalar(), scalar(), scalar(), scalar()),
-        (scalar(), scalar(), scalar(), scalar()),
+        (scalar(), scalar(), scalar(), option::of(arb_identifier())),
         (scalar(), scalar()),
         option::of(arb_date()),
         lists,
@@ -876,25 +885,31 @@ fn column_name_with_semicolons_round_trips() {
     assert_eq!(parse(&output).unwrap().records, vec![record]);
 }
 
-/// Writing Zotero keeps an identifier read beside the record's own, even when both belong in the
-/// same column: they are written there together, as Zotero lists several ISSNs. Regression test:
-/// the second one used to be dropped.
+/// Writing Zotero keeps an identifier read beside the generic record's own: an `ISSN` column is
+/// Zotero's own, so it is written there, and the other identifiers of the generic `isbn` columns
+/// are written in an `isbn` column of their own. Reading the output gives the same identifier.
+/// Regression test: the second one used to be dropped.
 #[test]
-fn zotero_keeps_second_identifier_in_same_column() {
-    for (input, expected) in [
+fn zotero_keeps_second_identifier() {
+    for (input, expected, column, other) in [
         (
             "title,isbn,ISSN\nT,0957-9672,1234-5678\n",
-            "0957-9672 1234-5678",
+            "0957-9672",
+            "csv:ISSN",
+            "1234-5678",
         ),
         (
             "title,isbn,ISBN\nT,978-3-16-148410-0,0-306-40615-2\n",
-            "978-3-16-148410-0 0-306-40615-2",
+            "0-306-40615-2",
+            "csv:isbn",
+            "978-3-16-148410-0",
         ),
     ] {
         let records = parse(input).unwrap().records;
         let zotero = serialize_as(Layout::Zotero, &records);
         let back = parse(&zotero).unwrap().records;
         assert_eq!(back[0].isbn.as_deref(), Some(expected), "{zotero}");
+        assert_eq!(back[0].extras[column], [other], "{zotero}");
     }
 }
 
@@ -987,4 +1002,142 @@ fn zotero_lower_case_issn_check_digit() {
     let output = serialize_as(Layout::Zotero, &[record]);
     let row = output.lines().nth(1).unwrap();
     assert_eq!(row.split(',').nth(7), Some("2345-678x"));
+}
+
+// -- Identifiers --
+
+/// Identifiers in the generic `isbn` column, separated by `;`, give the lowest; the others are
+/// kept in its extra, and written back in the same cell, joined with `; `.
+#[test]
+fn generic_identifiers_split_and_written_back() {
+    let record = only_record("title,isbn\nT,\"1939-1676 (Electronic); 0891-6640 (Print)\"\n");
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(record.extras["csv:isbn"], ["1939-1676 (Electronic)"]);
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("\"0891-6640; 1939-1676 (Electronic)\""));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// An ISSN-shaped identifier read from Zotero's `ISBN` stays in `ISBN` when other identifiers are
+/// kept for that column, so reading the output chooses it again.
+#[test]
+fn zotero_issn_shaped_isbn_stays_in_its_column() {
+    let header = "Key,Item Type,Publication Year,Title,ISBN,ISSN";
+    let record = only_record(&format!(
+        "{header}\nK,book,2020,T,0891-6640 978-3-16-148410-0,1939-1676\n"
+    ));
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    let output = serialize_as(Layout::Zotero, std::slice::from_ref(&record));
+    assert!(output.contains(",\"0891-6640; 978-3-16-148410-0\",1939-1676,"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// An identifier read from Zotero's `ISBN` stays there when `ISSN` lists a lower one, so reading
+/// the output does not choose the lower ISSN instead.
+#[test]
+fn zotero_isbn_stays_when_issn_is_lower() {
+    let header = "Key,Item Type,Publication Year,Title,ISBN,ISSN";
+    let record = only_record(&format!("{header}\nK,book,2020,T,1939-1676,0891-6640\n"));
+    assert_eq!(record.isbn.as_deref(), Some("1939-1676"));
+    let output = serialize_as(Layout::Zotero, std::slice::from_ref(&record));
+    assert!(output.contains(",1939-1676,0891-6640,"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// Identifiers in the generic `isbn` column give the lowest, and writing and reading the record
+/// again gives the same record.
+#[proptest]
+fn generic_identifiers_round_trip(#[strategy(arb_identifier_values())] listed: IdentifierValues) {
+    let cell = listed.values.join("; ");
+    let record = only_record(&format!("title,isbn\nT,\"{cell}\"\n"));
+    prop_assert_eq!(record.isbn.as_deref(), Some(listed.lowest()));
+    let output = serialize(std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// Identifiers in Zotero's `ISBN`, `ISSN` or both give the lowest of `ISBN`, or of `ISSN` when
+/// `ISBN` is empty, and writing and reading the record again gives the same record.
+#[proptest]
+fn zotero_identifiers_round_trip(
+    #[strategy(proptest::option::of(arb_identifier_values()))] isbns: Option<IdentifierValues>,
+    #[strategy(proptest::option::of(arb_identifier_values()))] issns: Option<IdentifierValues>,
+) {
+    let cell = |listed: &Option<IdentifierValues>| {
+        listed
+            .as_ref()
+            .map_or(String::new(), |listed| listed.values.join(" "))
+    };
+    let record = only_record(&format!(
+        "Key,Item Type,Publication Year,Title,ISBN,ISSN\nK,book,2020,T,\"{}\",\"{}\"\n",
+        cell(&isbns),
+        cell(&issns)
+    ));
+    let expected = isbns
+        .as_ref()
+        .or(issns.as_ref())
+        .map(IdentifierValues::lowest);
+    prop_assert_eq!(record.isbn.as_deref(), expected);
+    let output = serialize_as(Layout::Zotero, std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
+}
+
+/// Identifiers kept for Zotero's `ISSN` are all written when the record is written in another
+/// layout, where `ISSN` is a column of its own, joined with `; `. Regression test: only the first
+/// was written.
+#[test]
+fn identifier_extras_all_written_in_other_layouts() {
+    let header = "Key,Item Type,Publication Year,Title,ISBN,ISSN";
+    let record = only_record(&format!(
+        "{header}\nK,book,2020,T,978-3-16-148410-0,2222-2222 1111-1111\n"
+    ));
+    assert_eq!(record.extras["csv:ISSN"], ["2222-2222", "1111-1111"]);
+    let generic = serialize_as(Layout::Generic, std::slice::from_ref(&record));
+    assert!(generic.contains("\"2222-2222; 1111-1111\""), "{generic}");
+    let syrf = serialize_as(Layout::Syrf, std::slice::from_ref(&record));
+    assert!(syrf.contains("\"2222-2222; 1111-1111\""), "{syrf}");
+}
+
+/// Two identifier columns are read as one list: the lowest of both is chosen, and the record
+/// comes back the same when written and read again. Regression test: the choice was made from the
+/// first column only, and changed once both were written in one cell.
+#[test]
+fn duplicate_identifier_columns_round_trip() {
+    for (layout, input) in [
+        (Layout::Generic, "title,isbn,ISBN\nT,2222-2222,1111-1111\n"),
+        (
+            Layout::Zotero,
+            "Key,Item Type,Publication Year,Title,ISBN,ISBN\nK,book,2020,T,978-3-16-148410-0,0-306-40615-2\n",
+        ),
+    ] {
+        let record = parse_as(layout, input).unwrap().records.remove(0);
+        let output = serialize_as(layout, std::slice::from_ref(&record));
+        assert_eq!(parse_as(layout, &output).unwrap().records, [record]);
+    }
+    let generic = only_record("title,isbn,ISBN\nT,2222-2222,1111-1111\n");
+    assert_eq!(generic.isbn.as_deref(), Some("1111-1111"));
+    assert_eq!(generic.extras["csv:isbn"], ["2222-2222"]);
+}
+
+/// A generic identifier column whose header is not written `isbn` keeps the other identifiers
+/// under `csv:isbn`, the column it is written back to. Regression test: they were kept under the
+/// header as written, which changed when the record was written and read again.
+#[test]
+fn identifier_extras_keyed_by_written_column() {
+    let record = only_record("title, ISBN \nT,\"2222-2222; 1111-1111\"\n");
+    assert_eq!(record.extras["csv:isbn"], ["2222-2222"]);
+    let output = serialize(std::slice::from_ref(&record));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// A cell with no identifier or text, only separators, gives no identifier, so Zotero's `ISSN` is
+/// read when `ISBN` holds one; and a generic cell of `NA` with a separator is blank. Regression
+/// test: they gave an empty identifier, which hid the `ISSN` and could not be written back.
+#[test]
+fn separator_only_cell_gives_no_identifier() {
+    let header = "Key,Item Type,Publication Year,Title,ISBN,ISSN";
+    let fallback = only_record(&format!("{header}\nK,book,2020,T,;,1111-1111\n"));
+    assert_eq!(fallback.isbn.as_deref(), Some("1111-1111"));
+    let alone = only_record(&format!("{header}\nK,book,2020,T,;,\n"));
+    assert_eq!(alone.isbn, None);
+    assert_eq!(only_record("title,isbn\nT,\"NA,\"\n").isbn, None);
 }

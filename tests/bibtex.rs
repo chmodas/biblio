@@ -10,7 +10,9 @@ use test_strategy::{Arbitrary, proptest};
 use biblio::bibtex::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
-use common::{arb_blank, arb_date, arb_keyword, arb_url, first_extra};
+use common::{
+    IdentifierValues, arb_blank, arb_date, arb_identifier_values, arb_keyword, arb_url, first_extra,
+};
 
 // -- Core parsing --
 
@@ -729,8 +731,17 @@ fn double_hyphen_in_url_becomes_dash() {
 /// Parse a single entry whose fields, after the title, are `field_lines`, and return its
 /// identifier.
 fn identifier_of(field_lines: &str) -> Option<String> {
-    let input = format!("@article{{k,\n  title = {{t}},\n{field_lines}}}\n");
-    parse(&input).unwrap().records.remove(0).isbn
+    record_of(field_lines).isbn
+}
+
+/// An `isbn` of only separators lists no identifier, so the `issn` is read. Regression test: it
+/// gave an empty identifier, which hid the `issn`.
+#[test]
+fn separator_only_isbn_does_not_hide_issn() {
+    assert_eq!(
+        identifier_of("  isbn = {;},\n  issn = {2222-2222, 1111-1111},\n").as_deref(),
+        Some("1111-1111")
+    );
 }
 
 /// An entry with only an ISSN gets it as its identifier.
@@ -742,13 +753,15 @@ fn issn_read_when_no_isbn() {
     );
 }
 
-/// The ISBN is preferred over the ISSN, whichever comes first.
+/// The ISBN is preferred over the ISSN, whichever comes first, and the ISSN is kept in its extra.
 #[test]
 fn isbn_preferred_over_issn() {
     let isbn_first = identifier_of("  isbn = {978-3-16-148410-0},\n  issn = {1234-5678},\n");
     let isbn_last = identifier_of("  issn = {1234-5678},\n  isbn = {978-3-16-148410-0},\n");
     assert_eq!(isbn_first.as_deref(), Some("978-3-16-148410-0"));
     assert_eq!(isbn_last.as_deref(), Some("978-3-16-148410-0"));
+    let record = record_of("  isbn = {978-3-16-148410-0},\n  issn = {1234-5678},\n");
+    assert_eq!(record.extras["bibtex:issn"], ["1234-5678"]);
 }
 
 /// An empty or whitespace-only ISBN does not hide an ISSN that has a value.
@@ -769,11 +782,53 @@ fn issn_field_name_case_insensitive() {
     );
 }
 
-/// A field listing several ISSNs is kept as one string, not split.
+/// Parse a single entry whose fields, after the title, are `field_lines`.
+fn record_of(field_lines: &str) -> Record {
+    let input = format!("@article{{k,\n  title = {{t}},\n{field_lines}}}\n");
+    parse(&input).unwrap().records.remove(0)
+}
+
+/// A field listing several ISSNs gives the lowest, and keeps the others in its extra.
 #[test]
-fn several_issns_kept_verbatim() {
-    let identifier = identifier_of("  issn = {1234-5678, 2345-6789},\n");
-    assert_eq!(identifier.as_deref(), Some("1234-5678, 2345-6789"));
+fn several_issns_give_the_lowest() {
+    let record = record_of("  issn = {2345-6789, 1234-5678 (Print)},\n");
+    assert_eq!(record.isbn.as_deref(), Some("1234-5678"));
+    assert_eq!(record.extras["bibtex:issn"], ["2345-6789"]);
+}
+
+/// The ISBN wins over a lower ISSN beside it, and every ISSN is kept in `bibtex:issn`, one value
+/// per identifier; the ISBNs that lose stay in `bibtex:isbn`.
+#[test]
+fn issns_beside_isbn_kept() {
+    let record = record_of(
+        "  isbn = {978-3-16-148410-0 (hbk.); 978-0-306-40615-7},\n  issn = {2345-6789 1234-5678},\n",
+    );
+    assert_eq!(record.isbn.as_deref(), Some("978-0-306-40615-7"));
+    assert_eq!(record.extras["bibtex:isbn"], ["978-3-16-148410-0 (hbk.)"]);
+    assert_eq!(record.extras["bibtex:issn"], ["2345-6789", "1234-5678"]);
+}
+
+/// The identifiers are written back: the chosen one first in `isbn`, then the others of each
+/// field, joined with `, `, and reading the output gives the same record.
+#[test]
+fn identifiers_written_back() {
+    let record = record_of(
+        "  isbn = {978-3-16-148410-0 (hbk.); 978-0-306-40615-7},\n  issn = {2345-6789 1234-5678},\n",
+    );
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("  isbn = {978-0-306-40615-7, 978-3-16-148410-0 (hbk.)},\n"));
+    assert!(output.contains("  issn = {2345-6789, 1234-5678},\n"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// Without an `isbn`, the ISSNs that are not chosen are written back to `issn`, and the chosen
+/// one to `isbn`; reading that gives the same record.
+#[test]
+fn issns_alone_round_trip() {
+    let record = record_of("  issn = {2345-6789, 1234-5678},\n");
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("  isbn = {1234-5678},\n  issn = {2345-6789},\n"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
 }
 
 // -- Lenient parsing --
@@ -1599,7 +1654,7 @@ fn adversarial_parse_no_panic(
 /// which the parser rewrites, so a parsed value is the generated value trimmed.
 fn identifier_value() -> impl Strategy<Value = String> {
     let serial_number = "[0-9]{4}-[0-9]{3}[0-9X]";
-    let book_number = "97[89]-[0-9]{1,5}-[0-9]{1,7}-[0-9]{1,6}-[0-9X]";
+    let book_number = "97[89]-[0-9]{1,2}-[0-9]{3,4}-[0-9]{3,4}-[0-9X]";
     let single = prop_oneof![serial_number, book_number];
     let pair = (
         single.clone(),
@@ -1630,7 +1685,8 @@ struct IdentifierFields {
 }
 
 /// The parsed identifier matches a direct reference: trim the values, put `isbn` before `issn`,
-/// then take the first non-blank value, or the first value if all are blank.
+/// take the first non-blank value, or the first value if all are blank, and then the identifier in
+/// it with the lowest digits.
 #[proptest]
 fn identifier_fallback_matches_reference(input: IdentifierFields) {
     let mut field_lines = String::new();
@@ -1650,7 +1706,15 @@ fn identifier_fallback_matches_reference(input: IdentifierFields) {
         .iter()
         .find(|(_, value)| !value.is_empty())
         .or(by_preference.first())
-        .map(|(_, value)| value.clone());
+        .map(|(_, value)| {
+            let digits = |part: &str| part.replace('-', "");
+            value
+                .split([' ', ','])
+                .filter(|part| !part.is_empty())
+                .min_by(|a, b| digits(a).cmp(&digits(b)).then(a.cmp(b)))
+                .unwrap_or_default()
+                .to_owned()
+        });
 
     prop_assert_eq!(identifier, expected);
 }
@@ -1764,10 +1828,18 @@ fn byte_order_mark_does_not_change_result(
 const FOREIGN_KEYS: [&str; 3] = ["ris:KW", "nbib:OT", "endnote:keywords/keyword"];
 
 /// An extra naming a field the parser reads (or `xdata`, which is consumed when resolving) is never
-/// written, so it cannot leak into a field.
+/// written, so it cannot leak into a field. `isbn` and `issn` are left out: the other identifiers
+/// are written from `bibtex:isbn` and `bibtex:issn` by design.
 #[proptest]
 fn read_fields_never_written_from_extras(
-    #[strategy(proptest::sample::select(BIBTEX_RESERVED_FIELDS[..16].to_vec()))] name: &'static str,
+    #[strategy(proptest::sample::select(
+        BIBTEX_RESERVED_FIELDS[..16]
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "isbn" | "issn"))
+            .collect::<Vec<_>>()
+    ))]
+    name: &'static str,
     #[strategy(arb_bibtex_record())] record: Record,
 ) {
     let mut with_read_field = record.clone();
@@ -3552,4 +3624,28 @@ fn blank_list_values_not_written(
         list.push(blank.clone());
     }
     prop_assert_eq!(serialize(&[with_blanks]), serialize(&[record]));
+}
+
+/// The identifiers in `isbn` give the lowest of them, whatever lower ones `issn` lists; every other
+/// identifier is kept, and writing and reading the record again gives the same record.
+#[proptest]
+fn identifiers_round_trip(
+    #[strategy(arb_identifier_values())] isbns: IdentifierValues,
+    #[strategy(proptest::option::of(arb_identifier_values()))] issns: Option<IdentifierValues>,
+) {
+    let mut field_lines = format!("  isbn = {{{}}},\n", isbns.values.join(", "));
+    if let Some(issns) = &issns {
+        writeln!(field_lines, "  issn = {{{}}},", issns.values.join(", ")).unwrap();
+    }
+    let record = record_of(&field_lines);
+    prop_assert_eq!(record.isbn.as_deref(), Some(isbns.lowest()));
+    let kept = record.extras.get("bibtex:issn").map_or(0, Vec::len);
+    // Every identifier in `issn` is kept, and so is a value with no identifier.
+    let listed = issns.map_or(0, |issns| {
+        let texts = issns.values.iter().filter(|value| *value == "n/a").count();
+        issns.identifiers.len() + texts
+    });
+    prop_assert_eq!(kept, listed);
+    let output = serialize(std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
 }

@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use winnow::Parser;
 use winnow::token::{rest, take_while};
 
+use crate::identifier;
 use crate::parse_util::{
     append_to_last, append_to_opt, check_empty, first_non_blank, non_blank, non_blank_values,
     normalize_line_endings, own_extras, parsed, push_extra, report_missing_title,
@@ -34,7 +35,7 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// Every tag without a field is kept in [`Record::extras`] as `"ris:{tag}"`, one value per
 /// occurrence, with its continuation lines joined; the record type from `TY` is kept as `"ris:TY"`.
 /// Tags that are read but lose to another are dropped: `T1` when `TI` is present, `Y1` and `PY`
-/// (the last one wins), all but the last `SN`, `DB` and `LB`, and journal tags that lose to a
+/// (the last one wins), all but the last `DB` and `LB`, and journal tags that lose to a
 /// preferred one. So are dates in `PY` or `Y1` that cannot be read. The database from `DB` is kept
 /// in [`Record::database`], and the label from `LB` in [`Record::label`].
 ///
@@ -44,6 +45,11 @@ use crate::{Diagnostic, Error, Parsed, PublicationDate, Record};
 /// in order. Their continuation lines are joined to the value like any other tag's, so an export
 /// that lists several keywords one per line under a single `KW` gives one keyword. Values are
 /// trimmed, and blank ones are dropped.
+///
+/// # Identifiers
+///
+/// Every `SN`, with its continuation lines, may list identifiers. One is kept in [`Record::isbn`]
+/// by the rule described there, and the others in `"ris:SN"`.
 ///
 /// # Errors
 ///
@@ -131,7 +137,9 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// The record type comes from `extras["ris:TY"]`, falling back to `JOUR` (journal article). Pages
 /// are split into `SP`/`EP` tags on hyphens or en-dashes. Other `ris:` extras are written as tags
 /// after the fields, sorted by tag; keys that are not two-character tags, and tags the parser reads
-/// into fields, are skipped. Extras of other formats are not written.
+/// into fields, are skipped. The exception is `ris:SN`, the identifiers listed beside
+/// [`Record::isbn`], which are written as `SN` lines after it. Extras of other formats are not
+/// written.
 #[must_use]
 pub fn serialize(records: &[Record]) -> String {
     let mut buf = String::new();
@@ -191,6 +199,9 @@ pub fn serialize(records: &[Record]) -> String {
         }
 
         if let Some(isbn) = &record.isbn {
+            write_tag(&mut buf, "SN", isbn);
+        }
+        for isbn in record.extras.get("ris:SN").into_iter().flatten() {
             write_tag(&mut buf, "SN", isbn);
         }
 
@@ -344,7 +355,8 @@ struct PendingRecord {
     volume: Option<String>,
     number: Option<String>,
     abstract_text: Option<String>,
-    isbn: Option<String>,
+    /// The value of every `SN`, from which [`PendingRecord::finish`] chooses the identifier.
+    isbns: Vec<String>,
     database: Option<String>,
     label: Option<String>,
     keywords: Vec<String>,
@@ -370,7 +382,7 @@ impl PendingRecord {
                 "VL" => self.volume = Some(value.to_owned()),
                 "IS" => self.number = Some(value.to_owned()),
                 "AB" | "N2" => self.abstract_text = Some(value.to_owned()),
-                "SN" => self.isbn = Some(value.to_owned()),
+                "SN" => self.isbns.push(value.to_owned()),
                 "DB" => self.database = Some(value.to_owned()),
                 "LB" => self.label = Some(value.to_owned()),
                 "KW" => self.keywords.push(value.to_owned()),
@@ -399,6 +411,7 @@ impl PendingRecord {
             "DB" => append_to_opt(&mut self.database, text),
             "LB" => append_to_opt(&mut self.label, text),
             "AU" | "A1" => append_to_last(&mut self.authors, text),
+            "SN" => append_to_last(&mut self.isbns, text),
             "KW" => append_to_last(&mut self.keywords, text),
             "UR" => append_to_last(&mut self.urls, text),
             _ => {
@@ -424,6 +437,9 @@ impl PendingRecord {
         };
 
         let journal = first_non_blank(self.journals);
+        let mut extras = self.extras;
+        let isbn =
+            identifier::choose_into(self.isbns.iter().map(String::as_str), &mut extras, "ris:SN");
 
         Record {
             title,
@@ -435,12 +451,12 @@ impl PendingRecord {
             volume: self.volume,
             number: self.number,
             abstract_text: self.abstract_text,
-            isbn: self.isbn,
+            isbn,
             database: self.database,
             label: self.label,
             keywords: non_blank(self.keywords),
             urls: non_blank(self.urls),
-            extras: self.extras,
+            extras,
         }
     }
 }

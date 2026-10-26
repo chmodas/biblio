@@ -94,3 +94,95 @@ pub fn arb_blank() -> impl Strategy<Value = String> {
 pub fn first_extra<'a>(record: &'a Record, key: &str) -> Option<&'a str> {
     record.extras.get(key)?.first().map(String::as_str)
 }
+
+/// An ISSN, or an ISBN-13 hyphenated in one of several ways, as exports write them. A check digit
+/// may be `X` or `x`.
+pub fn arb_identifier() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[0-9]{4}-[0-9]{3}[0-9Xx]",
+        "97[89]-[0-9]{1,2}-[0-9]{3,4}-[0-9]{3,4}-[0-9X]",
+        "97[89][0-9]{9}[0-9X]",
+    ]
+}
+
+/// The identifiers of one record as an export lists them, and the values that list them.
+#[derive(Debug, Clone)]
+pub struct IdentifierValues {
+    /// Every identifier, without labels, in the order listed.
+    pub identifiers: Vec<String>,
+    /// One to three values, each listing one to three identifiers with or without a label, as
+    /// `(Print)`, `ISBN` or a glued `ISBN-13:`, separated by `, `, `; ` or a space, and sometimes a
+    /// value of text with no identifier, `n/a`. A value holds no line break, brace or `--`.
+    pub values: Vec<String>,
+}
+
+impl IdentifierValues {
+    /// The identifier a record keeps: the one with the lowest digits, compared as text, then the
+    /// lowest as written.
+    pub fn lowest(&self) -> &str {
+        self.identifiers
+            .iter()
+            .min_by(|a, b| digit_key(a).cmp(&digit_key(b)).then(a.cmp(b)))
+            .map_or("", String::as_str)
+    }
+}
+
+/// The digits of `identifier`, and its check digit `X` or `x`, upper-cased.
+pub fn digit_key(identifier: &str) -> String {
+    identifier
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == 'X' || *c == 'x')
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// The identifiers of one record, listed in one to three values.
+pub fn arb_identifier_values() -> impl Strategy<Value = IdentifierValues> {
+    let labels = proptest::sample::select(vec![
+        "",
+        " (Print)",
+        " (Electronic)",
+        " (Linking)",
+        " (ISBN)",
+        "ISBN ",
+        "ISBN-13:",
+    ]);
+    let written = (arb_identifier(), labels).prop_map(|(identifier, label)| {
+        let text = if label.ends_with([' ', ':']) {
+            format!("{label}{identifier}")
+        } else {
+            format!("{identifier}{label}")
+        };
+        (identifier, text)
+    });
+    let value = (
+        proptest::collection::vec(written, 1..=3),
+        proptest::sample::select(vec![", ", "; ", " "]),
+    );
+    let values = (proptest::collection::vec(value, 1..=3), any::<bool>());
+    values.prop_map(|(values, with_text)| {
+        let identifiers = values
+            .iter()
+            .flat_map(|(written, _)| written.iter().map(|(identifier, _)| identifier.clone()))
+            .collect();
+        let values = values
+            .iter()
+            .map(|(written, separator)| {
+                written
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(separator)
+            })
+            .collect::<Vec<_>>();
+        let values = if with_text {
+            [values, vec!["n/a".to_owned()]].concat()
+        } else {
+            values
+        };
+        IdentifierValues {
+            identifiers,
+            values,
+        }
+    })
+}
