@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::identifier;
 use crate::parse_util::{
     check_empty, non_blank, non_blank_values, own_extras, parsed, push_extra, report_missing_title,
     strip_byte_order_mark,
@@ -41,8 +42,8 @@ pub enum Layout {
     Generic,
     /// Zotero's CSV export: `Title`, `Author`, `Date` (preferred over `Publication Year`),
     /// `Publication Title`, `DOI`, `Pages`, `Volume`, `Issue`, `Abstract Note`, `ISBN` (preferred
-    /// over `ISSN`), `Manual Tags` and `Url`, which holds one link. `Key` and `Item Type` are kept
-    /// in extras and written back in their own columns.
+    /// over `ISSN` when choosing the identifier), `Manual Tags` and `Url`, which holds one link.
+    /// `Key` and `Item Type` are kept in extras and written back in their own columns.
     Zotero,
     /// The `SyRF` import layout: `Title`, `Authors`, `Year`, `PublicationName`, `DOI`, `Abstract`,
     /// `Keywords` and `Url`, which holds one link. `AlternateName`, `AuthorAddress`,
@@ -87,7 +88,7 @@ impl Field {
 }
 
 /// What a column of a layout writes: a field, or the value of the extra with its name.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Source {
     Field(Field),
     PassThrough,
@@ -193,6 +194,14 @@ impl Layout {
         })
     }
 
+    /// The name of the column this layout writes `field` to, or an empty name if it has none.
+    fn column_name(self, field: Field) -> &'static str {
+        self.columns()
+            .iter()
+            .find(|&&(_, source)| source == Source::Field(field))
+            .map_or("", |&(name, _)| name)
+    }
+
     /// Whether an extra named `name` would be written in, or read back into, one of this layout's
     /// own columns, so that it must not get a column of its own.
     fn is_own_column(self, name: &str) -> bool {
@@ -269,6 +278,17 @@ pub fn parse(input: &str) -> Result<Parsed, Error> {
 /// `YYYY-MM-DD` (a month or day out of range is left out), and from the year column otherwise,
 /// which is then not kept. A date that cannot be read is dropped. A row whose cells are all blank
 /// is skipped.
+///
+/// # Identifiers
+///
+/// The identifier cells, `isbn` in the generic layout and Zotero's `ISBN`, or its `ISSN` when no
+/// `ISBN` cell lists one, may list several identifiers, as Zotero lists ISSNs separated by spaces.
+/// When a header repeats an identifier column, the cells of every copy are read together. One
+/// identifier is kept in [`Record::isbn`] by the rule described there, and the others under the
+/// column the layout writes them to: `"csv:isbn"` in the generic layout, and `"csv:ISBN"` or
+/// `"csv:ISSN"` in Zotero's, whatever the header was written as. Every identifier of an `ISSN`
+/// beside an `ISBN` is kept in `"csv:ISSN"`, one value per identifier. A cell of only separators
+/// gives no identifier.
 ///
 /// # Diagnostics
 ///
@@ -386,6 +406,8 @@ fn read_row(
 ) -> Record {
     // The first non-blank value of each field, with the index of its column.
     let mut values: [Option<(&str, usize)>; Field::COUNT] = [None; Field::COUNT];
+    // Every non-blank `ISBN` cell, then every non-blank `ISSN` cell, in column order.
+    let mut identifiers: [Vec<&str>; 2] = [Vec::new(), Vec::new()];
     let mut extras: HashMap<String, Vec<String>> = HashMap::new();
 
     for (index, column) in columns.iter().enumerate() {
@@ -394,6 +416,8 @@ fn read_row(
             continue;
         }
         match column.field {
+            Some(Field::Isbn) => identifiers[0].push(cell),
+            Some(Field::Issn) => identifiers[1].push(cell),
             Some(field) if values[field as usize].is_none() => {
                 values[field as usize] = Some((cell, index));
             }
@@ -404,15 +428,7 @@ fn read_row(
     let value = |field: Field| values[field as usize].map(|(cell, _)| cell);
     let owned = |field: Field| value(field).map(str::to_owned);
 
-    // The identifier: `ISBN`, or `ISSN` when it is blank. An `ISSN` beside an `ISBN` is kept.
-    let isbn = match (values[Field::Isbn as usize], values[Field::Issn as usize]) {
-        (Some((preferred, _)), Some((beside, index))) => {
-            push_extra(&mut extras, columns[index].key.clone(), beside);
-            Some(preferred.to_owned())
-        }
-        (Some((isbn, _)), None) => Some(isbn.to_owned()),
-        (None, issn) => issn.map(|(issn, _)| issn.to_owned()),
-    };
+    let isbn = read_identifiers(layout, identifiers, &mut extras);
 
     // The date column wins when it can be read, and the year column is then not kept. Text in
     // either that gives no date is kept in extras.
@@ -459,6 +475,39 @@ fn read_row(
         urls,
         extras,
     }
+}
+
+/// Choose the identifier from the `ISBN` cells of a row, or from its `ISSN` cells when no `ISBN`
+/// cell lists one, as [`Record::isbn`] describes.
+///
+/// The others are kept one value per identifier, an `ISSN` beside an `ISBN` included, under the
+/// column the layout writes them to (`csv:isbn`, `csv:ISBN` or `csv:ISSN`), whatever the header
+/// they were read from. An identifier that the layout would read as blank, such as a generic `NA`,
+/// is none.
+fn read_identifiers(
+    layout: Layout,
+    cells: [Vec<&str>; 2],
+    extras: &mut HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let preferred = cells
+        .iter()
+        .position(|cells| cells.iter().any(|cell| !identifier::split(cell).is_empty()));
+    let mut isbn = None;
+    for (index, (field, cells)) in [Field::Isbn, Field::Issn]
+        .into_iter()
+        .zip(cells)
+        .enumerate()
+    {
+        let key = format!("csv:{}", layout.column_name(field));
+        if Some(index) == preferred {
+            isbn = identifier::choose_into(cells, extras, &key);
+        } else {
+            for cell in cells {
+                identifier::split_into(cell, extras, &key);
+            }
+        }
+    }
+    isbn.filter(|isbn| !is_blank(layout, isbn))
 }
 
 /// Whether `cell` holds no value: it is blank, or, in the generic layout, exactly `NA`, which R
@@ -651,9 +700,13 @@ pub fn serialize(records: &[Record]) -> String {
 /// List values are joined with `; `, and blank ones are skipped. An extra's first value is written,
 /// because a cell holds one value; extras of other formats are not written. An extra that the
 /// layout would read into a field, such as a date that could not be read, is written in that
-/// field's column when the record leaves it empty; a second identifier is added to the record's
-/// own with a space, as Zotero lists several ISSNs. Zotero writes the identifier to `ISSN` when
-/// every part of it looks like an ISSN (`1234-5678`), and to `ISBN` otherwise.
+/// field's column when the record leaves it empty. The identifiers listed beside [`Record::isbn`]
+/// are the exception: every one is written in its column, after the record's own when they share
+/// it, joined with `; `; in a layout where they have a column of their own, such as Zotero's `ISSN`
+/// written in the generic layout, every one is written there, joined the same way. Zotero writes
+/// the identifier to `ISSN` when every part of it looks like an ISSN (`1234-5678`), and to `ISBN`
+/// otherwise; it stays in `ISBN` when other identifiers are kept for `ISBN`, or `ISSN` holds a
+/// lower one, so that reading the output chooses it again.
 ///
 /// Values are trimmed when read, so leading and trailing whitespace is lost. Some values do not
 /// come back the same when read again: a list value containing `;` splits; a blank title is read
@@ -695,11 +748,13 @@ pub fn serialize_as(layout: Layout, records: &[Record]) -> String {
 
     for record in records {
         let extra = |name: &str| {
-            record
-                .extras
-                .get(&format!("csv:{name}"))
-                .and_then(|values| values.first())
-                .cloned()
+            let values = record.extras.get(&format!("csv:{name}"))?;
+            if is_identifier_column(name) {
+                let joined = non_blank_values(values).collect::<Vec<_>>().join("; ");
+                (!joined.is_empty()).then_some(joined)
+            } else {
+                values.first().cloned()
+            }
         };
         let cells: Vec<String> = layout
             .columns()
@@ -722,19 +777,21 @@ pub fn serialize_as(layout: Layout, records: &[Record]) -> String {
 ///
 /// An extra counts when `layout` would read a column of its name into `field`. It fills a column
 /// the record leaves empty, and a date column whose date has no month, which the year already
-/// gives; in Zotero, a second identifier is added to the identifier with a space, as Zotero lists
-/// several ISSNs.
+/// gives. For an identifier column, every such extra is added to the record's identifier, joined
+/// with `; `.
 fn field_cell(layout: Layout, field: Field, record: &Record) -> Option<String> {
-    let beside = own_extras(&record.extras, "csv")
-        .into_iter()
-        .find(|(name, _)| layout.field_for(name) == Some(field))
-        .and_then(|(_, values)| non_blank_values(values).next())
-        .map(str::to_owned);
     let own = cell(layout, field, record);
-    match (own, beside) {
-        (Some(own), Some(beside)) if matches!(field, Field::Isbn | Field::Issn) => {
-            Some(format!("{own} {beside}"))
-        }
+    let mut beside = extras_for(layout, field, record);
+    if matches!(field, Field::Isbn | Field::Issn) {
+        let identifiers: Vec<&str> = own
+            .as_deref()
+            .filter(|own| !own.trim().is_empty())
+            .into_iter()
+            .chain(beside)
+            .collect();
+        return (!identifiers.is_empty()).then(|| identifiers.join("; "));
+    }
+    match (own, beside.next().map(str::to_owned)) {
         (_, Some(beside))
             if field == Field::IsoDate && record.date.is_some_and(|date| date.month.is_none()) =>
         {
@@ -743,6 +800,15 @@ fn field_cell(layout: Layout, field: Field, record: &Record) -> Option<String> {
         (Some(own), _) => Some(own),
         (None, beside) => beside,
     }
+}
+
+/// The non-blank values of the `csv:` extras of `record` that `layout` reads into `field`, in the
+/// order of their names.
+fn extras_for(layout: Layout, field: Field, record: &Record) -> impl Iterator<Item = &str> {
+    own_extras(&record.extras, "csv")
+        .into_iter()
+        .filter(move |(name, _)| layout.field_for(name) == Some(field))
+        .flat_map(|(_, values)| non_blank_values(values))
 }
 
 /// The text of `field` of `record` in `layout`, if it has one.
@@ -764,7 +830,14 @@ fn cell(layout: Layout, field: Field, record: &Record) -> Option<String> {
         Field::Abstract => record.abstract_text.clone(),
         Field::Isbn | Field::Issn => {
             let isbn = record.isbn.as_deref()?;
-            let to_issn = layout == Layout::Zotero && is_issn_list(isbn);
+            let to_issn = layout == Layout::Zotero && is_issn_list(isbn) && {
+                // Only where reading the columns back chooses as reading `isbn` alone would:
+                // `ISBN` is read first, so it must hold nothing else, and `ISSN` nothing lower.
+                let issns = extras_for(layout, Field::Issn, record);
+                extras_for(layout, Field::Isbn, record).next().is_none()
+                    && identifier::choose(std::iter::once(isbn).chain(issns)).chosen
+                        == identifier::choose([isbn]).chosen
+            };
             (to_issn == (field == Field::Issn)).then(|| isbn.to_owned())
         }
         Field::Database => record.database.clone(),
@@ -773,6 +846,14 @@ fn cell(layout: Layout, field: Field, record: &Record) -> Option<String> {
         Field::Urls => list(&record.urls),
         Field::Link => non_blank_values(&record.urls).next().map(str::to_owned),
     }
+}
+
+/// Whether a column named `name` holds identifiers in the generic or the Zotero layout, so that an
+/// extra of that name lists one identifier per value.
+fn is_identifier_column(name: &str) -> bool {
+    [Layout::Generic, Layout::Zotero]
+        .into_iter()
+        .any(|layout| matches!(layout.field_for(name), Some(Field::Isbn | Field::Issn)))
 }
 
 /// Whether every part of `identifier`, split on whitespace, `,` and `;`, has the shape of an ISSN:

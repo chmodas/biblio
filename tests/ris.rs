@@ -11,8 +11,8 @@ use biblio::ris::{parse, serialize};
 use biblio::{Diagnostic, Error, PublicationDate, Record};
 
 use common::{
-    arb_author, arb_blank, arb_date, arb_keyword, arb_pages, arb_raw_value, arb_text, arb_url,
-    arb_volume, first_extra,
+    IdentifierValues, arb_author, arb_blank, arb_date, arb_identifier_values, arb_keyword,
+    arb_pages, arb_raw_value, arb_text, arb_url, arb_volume, first_extra,
 };
 
 // -- Core parsing --
@@ -1383,11 +1383,12 @@ fn extras_hold_exactly_the_unread_tags(
     prop_assert_eq!(kept, !RIS_READ_TAGS.contains(&tag.as_str()));
 }
 
-/// An extra naming a tag the parser reads is never written, so it cannot leak into a field. `TY` is
-/// left out: it is written from `ris:TY` by design.
+/// An extra naming a tag the parser reads is never written, so it cannot leak into a field. `TY`
+/// and `SN` are left out: they are written from `ris:TY` and `ris:SN` by design.
 #[proptest]
 fn read_tags_never_written_from_extras(
-    #[strategy(select(RIS_READ_TAGS[1..].to_vec()))] tag: &'static str,
+    #[strategy(select(RIS_READ_TAGS[1..].iter().copied().filter(|tag| *tag != "SN").collect::<Vec<_>>()))]
+    tag: &'static str,
     #[strategy(arb_ris_record())] record: Record,
 ) {
     let mut with_read_tag = record.clone();
@@ -1475,4 +1476,80 @@ fn records_stable_through_serialize(
     let first = parse(&input).unwrap().records;
     let second = parse(&serialize(&first)).unwrap().records;
     prop_assert_eq!(second, first);
+}
+
+// -- Identifiers --
+
+/// The record read from `tag_lines` between `TY` and `ER`.
+fn record_with(tag_lines: &str) -> Record {
+    parse(&format!("TY  - JOUR\n{tag_lines}ER  -\n"))
+        .unwrap()
+        .records
+        .remove(0)
+}
+
+/// Several `SN` lines give the lowest identifier, without its label, and the others are kept in
+/// `ris:SN` as written, in order.
+#[test]
+fn several_sn_lines_give_the_lowest() {
+    let record =
+        record_with("SN  - 1939-1676 (Electronic)\nSN  - 0891-6640 (Print)\nSN  - 1234-5678\n");
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(
+        record.extras["ris:SN"],
+        ["1939-1676 (Electronic)", "1234-5678"]
+    );
+}
+
+/// Several identifiers in one `SN`, separated by `;`, are split.
+#[test]
+fn identifiers_in_one_sn_are_split() {
+    let record = record_with("SN  - 978-131750096-4 (ISBN); 978-113888701-5 (ISBN)\n");
+    assert_eq!(record.isbn.as_deref(), Some("978-113888701-5"));
+    assert_eq!(record.extras["ris:SN"], ["978-131750096-4 (ISBN)"]);
+}
+
+/// A label glued to the next identifier, and a literal backslash and `r` standing for a lost line
+/// break, are split from the identifiers around them.
+#[test]
+fn glued_identifiers_are_split() {
+    let glued = record_with("SN  - 0964-6906 (Print)0964-6906\n");
+    assert_eq!(glued.isbn.as_deref(), Some("0964-6906"));
+    assert_eq!(glued.extras["ris:SN"], ["0964-6906 (Print)"]);
+    let escaped = record_with("SN  - 1757-4676 (Print)\\r1757-4676\n");
+    assert_eq!(escaped.isbn.as_deref(), Some("1757-4676"));
+    assert_eq!(escaped.extras["ris:SN"], ["\\r1757-4676"]);
+}
+
+/// A continuation line of `SN` is joined to it, so its identifier is read too. Regression test:
+/// it used to be dropped.
+#[test]
+fn sn_continuation_read() {
+    let record = record_with("SN  - 1939-1676\n  0891-6640\n");
+    assert_eq!(record.isbn.as_deref(), Some("0891-6640"));
+    assert_eq!(record.extras["ris:SN"], ["1939-1676"]);
+}
+
+/// The chosen identifier is written first, then one `SN` per other identifier, and reading the
+/// output gives the same record.
+#[test]
+fn identifiers_written_back() {
+    let record = record_with("SN  - 1939-1676 (Electronic)\nSN  - 0891-6640 (Print)\n");
+    let output = serialize(std::slice::from_ref(&record));
+    assert!(output.contains("SN  - 0891-6640\nSN  - 1939-1676 (Electronic)\n"));
+    assert_eq!(parse(&output).unwrap().records, [record]);
+}
+
+/// Identifiers listed in any number of `SN` lines give the lowest, and writing and reading the
+/// record again gives the same record.
+#[proptest]
+fn identifiers_round_trip(#[strategy(arb_identifier_values())] listed: IdentifierValues) {
+    let mut tag_lines = String::new();
+    for value in &listed.values {
+        writeln!(tag_lines, "SN  - {value}").unwrap();
+    }
+    let record = record_with(&tag_lines);
+    prop_assert_eq!(record.isbn.as_deref(), Some(listed.lowest()));
+    let output = serialize(std::slice::from_ref(&record));
+    prop_assert_eq!(parse(&output).unwrap().records, vec![record]);
 }

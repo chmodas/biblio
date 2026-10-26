@@ -134,6 +134,33 @@ pub struct Record {
 
     /// ISBN (books) or ISSN (journals), depending on the publication type and what the source
     /// format provides.
+    ///
+    /// A record can list several, such as a journal's print and electronic ISSNs, and every format
+    /// keeps one here by the same rule, so the order they are listed in does not matter:
+    ///
+    /// - **Splitting:** each value is split at `,`, `;` and line breaks, and then at whitespace.
+    ///   Text in parentheses, such as `(Print)`, is one piece, and a label even if it holds digits;
+    ///   so is a word with fewer than eight digits, such as `ISBN` or `ISBN-13:`. A label belongs
+    ///   to the identifier before it, or to the first identifier when it comes before every one.
+    /// - **Choosing:** the identifier whose digits, with an `X` check digit, come first when
+    ///   compared as text is kept, without its labels or the characters around its digits, so
+    ///   `0891-6640 (Print)` gives `0891-6640`. A value with no identifier, such as `n/a`, is kept
+    ///   whole, but only when there is no identifier at all.
+    /// - **The others** are kept, as written with their labels, in the format's own extra:
+    ///   `"ris:SN"`, `"nbib:IS"`, `"endnote:isbn"`, `"bibtex:isbn"` or `"bibtex:issn"`, or the CSV
+    ///   column's. The serialiser writes them back after this identifier. Like other extras, they
+    ///   are not written to another format.
+    ///
+    /// `BibTeX` and CSV read the identifier from the `ISBN` field or column, and from `ISSN` only
+    /// when that is blank, so an ISBN is kept even when a lower ISSN is listed beside it.
+    ///
+    /// Some identifiers do not come back as set. A record whose identifier is not the lowest of
+    /// those it lists, or holds several, gets the lowest when it is written and read again. Blank
+    /// values are not kept; `EndNote XML` and CSV, which cannot write an empty identifier, give
+    /// none for a value of only whitespace or separators. An ISBN written with spaces between its
+    /// groups (`978 3 16 148410 0`) is kept whole only when nothing else is listed. Two exports of
+    /// one article agree only when both list its lowest identifier: one that leaves out the
+    /// electronic ISSN, when that ISSN is the lowest, gives the print ISSN instead.
     pub isbn: Option<String>,
 
     /// The bibliographic database the record was exported from, as the source names it (e.g.
@@ -193,8 +220,9 @@ pub struct Record {
     ///
     /// Each serialiser writes only the keys of its own format, so values read from one format are
     /// kept on the record but not written to another. It skips keys that are not valid tags in its
-    /// format, and keys for tags it reads into the fields above. `BibTeX` and CSV write only the
-    /// first value of a key, because a field or cell holds one value.
+    /// format, and keys for tags it reads into the fields above, except the identifiers listed
+    /// beside [`Record::isbn`]. `BibTeX` and CSV write only the first value of a key, because a
+    /// field or cell holds one value, except for those identifiers, which they write together.
     pub extras: HashMap<String, Vec<String>>,
 }
 
